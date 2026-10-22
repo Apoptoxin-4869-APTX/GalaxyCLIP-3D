@@ -1,0 +1,17 @@
+# Outputs, checkpoints, data
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.hdf5
+*.h5
+*.npz
+*.npy
+
+# Caches, logs, editor state
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.claude/
+wandb/
+slurm/log/
