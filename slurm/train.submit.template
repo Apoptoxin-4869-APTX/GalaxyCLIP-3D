@@ -1,0 +1,58 @@
+#!/bin/bash
+# Template for a multi-GPU training job on the ZHAW cluster, adapted from
+# GalaxyCLIP-2D's slurm/encoder_astrom3.submit (commit 8b0a377). Copy to
+# slurm/<name>.submit and fill in TRAIN_SCRIPT, the data staging and the overrides.
+#
+# Cluster rules this keeps (see the 2D repo's notes):
+#   * --account=cai_ivs and --gres-flags=enforce-binding on every GPU job
+#   * submit with `env -u SLURM_JOB_ID sbatch ...` (a leaked SLURM_JOB_ID breaks sbatch)
+#   * --export=ALL,K=a,b splits on commas -> export comma-containing values in the shell
+#   * /scratch is private per job; stage data there, not in /raid/persistent_scratch (30 GB cap)
+#   * time limit: gpu_top max 24 h; SIGUSR1 300 s before the end -> requeue, resume from latest.pt
+#SBATCH --job-name=galaxyclip3d
+#SBATCH --time=24:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --partition=gpu_top
+#SBATCH --gres=gpu:1
+#SBATCH --gres-flags=enforce-binding
+#SBATCH --account=cai_ivs
+#SBATCH --signal=B:SIGUSR1@300
+#SBATCH --output=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/%j_%N.out
+#SBATCH --error=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/%j_%N.err
+
+set -uo pipefail
+PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
+VENV_PATH=/raid/persistent_scratch/magilolg/venvs/galaxyclip      # per node; exists on trinity + fresko
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-train.py}"                          # TODO: the 3D trainer
+SOURCE_DATA_DIR=/cluster/projects/ska/illustris/tng50-1.3D/domain_translation
+DATA_DIR=/scratch/magilolg/galaxyclip3d/data
+NPROC="${NPROC:-$(nvidia-smi -L 2>/dev/null | wc -l)}"; NPROC="${NPROC:-1}"
+mkdir -p "${PROJECT_DIR}/slurm/log" "${DATA_DIR}"
+
+# ── Requeue: forward SIGUSR1 to python (it saves at the next safe point), then requeue
+sig_handler_USR1() {
+    echo "STOP SIGNAL DETECTED — $(date)"
+    if [[ -n "${PY_PID:-}" ]]; then
+        kill -USR1 "${PY_PID}" 2>/dev/null || true
+        for i in $(seq 1 150); do kill -0 "${PY_PID}" 2>/dev/null || break; sleep 1; done
+    fi
+    scontrol requeue "${SLURM_JOB_ID}"
+    exit 0
+}
+trap 'sig_handler_USR1' USR1
+
+# ── Stage data to the job-private local disk (the 3D sets are 4-8 GB)
+t0=$(date +%s)
+rsync -a "${SOURCE_DATA_DIR}/" "${DATA_DIR}/"
+echo "[stage] $(du -sh "${DATA_DIR}" | cut -f1) in $(( $(date +%s) - t0 ))s"
+
+source "${VENV_PATH}/bin/activate"
+cd "${PROJECT_DIR}"
+torchrun --standalone --nproc_per_node="${NPROC}" "${TRAIN_SCRIPT}" \
+    --config-overrides data_dir="${DATA_DIR}" "$@" &
+PY_PID=$!
+wait ${PY_PID}
+exit $?

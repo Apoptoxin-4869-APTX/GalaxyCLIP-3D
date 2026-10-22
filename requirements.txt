@@ -1,0 +1,6 @@
+# Same base environment as GalaxyCLIP-2D (torch 2.5.1+cu124 on the cluster venv)
+torch>=2.1
+numpy
+h5py
+wandb
+# Point-cloud encoders: add the chosen library here (e.g. torch-cluster / pytorch3d / a PointNet++ implementation)
