@@ -47,6 +47,78 @@ train the 3D encoder to match them (anchor / ImageBind-style). The repos then on
 embedding file. To keep that possible, every 3D sample should carry `(snapshot, halo)`, and the
 3D embeddings should follow the 2D conventions: 512-d, L2-normalized, InfoNCE with τ = 0.07.
 
+## Raw snapshot 99 — source for new point clouds
+
+New point clouds are to be extracted from the raw TNG50-1 data at
+`/cluster/projects/ska/illustris/tng50-1/` (`snapshots/099/`, `groupcats/099/`,
+`offsets/offsets_099.hdf5`). Audit from `tools/audit_snapshot.py`, 2026-10-27:
+
+**The snapshot is incomplete.** 108 of its 680 files were never downloaded and
+`snap_099.657.hdf5` is truncated, so 109 files (~16 % of every particle type) are unreadable.
+Particles are stored in FoF-group order, so the gaps remove whole blocks of specific halos:
+
+| Halos with 2D maps (snapshot 99) | Complete on disk |
+|---|---|
+| gid 0–99 | 55 / 100 |
+| gid 100–499 | 289 / 400 |
+| gid 500–999 | 210 / 499 |
+| gid 1000–1999 | 176 / 992 |
+| gid 2000–3014 | 0 / 1,000 |
+| **All** | **730 / 2,991** |
+
+Gas is complete for all of them; stars are incomplete for 1,975 halos, dark matter for 244 and
+black holes for 504. Per-halo table: `data/snap099_halo_availability.csv` (FoF particle counts,
+unreadable particles per type, 2D cube half-width, box-edge flag). Ways to complete them, both
+needing a personal TNG API key (the original download job used another user's):
+
+- per-halo API cutouts of the incomplete types — stars 368 M + dark matter 44 M particles, **~24 GB**;
+- re-downloading the 109 files — **~469 GB**, completes the whole box.
+
+### How the 2D maps select particles
+
+The 2D maps were made with [skais-mapper](https://github.com/phdenzel/skais-mapper) (configs
+`tng50-1-{snapshot}-2D-{gid range}`). Each map keeps the **FoF-group particles inside a cube
+centred on the central subhalo's `SubhaloPos`, with half-width = the central's gas half-mass
+radius** (`SubhaloHalfmassRadType[central, 0]`, the map's `extent` attribute), rotated by
+`rotxy` for views 1–3. `tools/check_2d_selection.py` reproduces the stored `num_particles`
+of the unrotated view:
+
+| gid | gas | dark matter | stars |
+|---|---|---|---|
+| 100 | exact | −8 of 1.89 M | −1 of 1.40 M |
+| 500 | exact | +1 | exact |
+| 1031 | −2 | −4 | exact |
+| 2913 | exact | +2 | not on disk |
+| 765 | −1 | −2 | exact |
+
+The differences are particles on a cube face that flip with floating-point rounding; the exact
+arithmetic of the July 2025 run is not recoverable from the current skais-mapper code.
+
+Worth knowing before matching 2D content in 3D:
+- **No periodic wrapping.** 24 of the 2,991 cubes cross the box edge and lose whatever lies
+  beyond it (gid 765: 96,454 gas cells in the 2D map, 126,175 with wrapping). Flagged in the CSV.
+- **Star maps include wind-phase cells** (no `GFM_StellarFormationTime > 0` cut).
+- `temp` and `bfield` are mass-weighted means along the line of sight; `hi-21cm` converts the
+  HI column to a brightness temperature in mK.
+- SPH smoothing radii use (0.75·π·V)^(1/3), ~2.1× the equal-volume radius (affects only the 2D blur).
+- skais-mapper's `halo_index` is "the i-th halo with a central" for the subhalo and "FoF group i"
+  for the particles; the two agree only while every halo up to i has a central (true for these gids).
+- Halos whose central has < 10,000 gas cells were skipped and replaced by the next gid, hence
+  "the next 1,000 existing gids" per 2D file.
+
+### Reading the files
+
+The official loader `illustris_python` expects `snapdir_099/`, `groups_099/` and
+`../postprocessing/offsets/`, so with this layout it needs a directory of symlinks or patched
+paths (skais-mapper reads it as is). `FileOffsets/SnapByType` is stored as (files, 6), not
+[6, files] as the TNG documentation says. Coordinates are float64 and the largest halo has
+415 M dark-matter particles, so read big halos in chunks (or `loadSubset(..., float32=True)`).
+
+```bash
+python tools/audit_snapshot.py --csv data/snap099_halo_availability.csv   # ~2 min, numpy + h5py
+python tools/check_2d_selection.py 100 500 1031 2913 765                  # ~1.5 min
+```
+
 ## Code shared with GalaxyCLIP-2D
 
 Copied from GalaxyCLIP-2D commit `8b0a377` (modality-agnostic, unchanged unless noted):
