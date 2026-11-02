@@ -1,0 +1,66 @@
+#!/bin/bash
+# Download a fresh copy of TNG50-1 snapshot 99 (about 2.9 TB, plus 7.4 GB of group catalog and
+# offsets) with tools/download_snapshot.py. Needs the API key in ~/.tng_api_key (mode 600).
+#
+#   python3 tools/download_snapshot.py check --dest "$DEST"       # first: test key and server
+#   env -u SLURM_JOB_ID sbatch slurm/download_snapshot.submit     # start (or continue) the download
+#   python3 tools/download_snapshot.py status --dest "$DEST" --watch 10
+#
+# To change where it goes or the parallelism: DEST=... WORKERS=... sbatch --export=ALL ...
+#
+# Cluster rules this keeps (see the 2D repo's notes):
+#   * --account=cai_ivs is mandatory; no GPU, so no enforce-binding
+#   * submit with `env -u SLURM_JOB_ID sbatch ...` (a leaked SLURM_JOB_ID breaks sbatch)
+#   * cpu partition: max 5 days. SIGUSR1 300 s before the time limit -> python stops cleanly and the
+#     job requeues itself. Finished files are kept and partial files continue, so nothing is lost.
+#   * /usr/bin/python3 and the standard library only: venvs live on per-node disks
+#SBATCH --job-name=tng50-snap99
+#SBATCH --time=3-00:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=8G
+#SBATCH --partition=cpu
+#SBATCH --account=cai_ivs
+#SBATCH --signal=B:SIGUSR1@300
+#SBATCH --requeue
+#SBATCH --open-mode=append
+#SBATCH --output=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/download_snapshot_%j.out
+#SBATCH --error=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/download_snapshot_%j.out
+
+set -uo pipefail
+PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
+DEST="${DEST:-/cluster/projects/ska/illustris/tng50-1.snap099}"
+WORKERS="${WORKERS:-4}"
+mkdir -p "${PROJECT_DIR}/slurm/log"
+
+# ── Requeue: forward SIGUSR1 to python (it stops at the next block), then requeue
+sig_handler_USR1() {
+    echo "STOP SIGNAL DETECTED — $(date)"
+    if [[ -n "${PY_PID:-}" ]]; then
+        kill -USR1 "${PY_PID}" 2>/dev/null || true
+        for i in $(seq 1 150); do kill -0 "${PY_PID}" 2>/dev/null || break; sleep 1; done
+    fi
+    scontrol requeue "${SLURM_JOB_ID}"
+    exit 0
+}
+trap 'sig_handler_USR1' USR1
+
+cd "${PROJECT_DIR}"
+echo "[download] $(date) on $(hostname), job ${SLURM_JOB_ID:-none}, $(python3 --version), to ${DEST}"
+# Exit code 0: all done. 3: stopped by a signal, the trap above takes over. Anything else (files given
+# up on during a long server outage, say) is worth another pass, which skips the finished files.
+PASSES=5
+for pass in $(seq 1 ${PASSES}); do
+    python3 -I -u tools/download_snapshot.py get --dest "${DEST}" --workers "${WORKERS}" --with-catalogs "$@" &
+    PY_PID=$!
+    wait ${PY_PID}
+    rc=$?
+    [[ ${rc} -eq 0 || ${rc} -eq 3 ]] && exit ${rc}
+    echo "[download] pass ${pass} of ${PASSES} ended with exit code ${rc} — $(date)"
+    if [[ ${pass} -lt ${PASSES} ]]; then
+        sleep 300 &
+        wait $!
+    fi
+done
+exit ${rc}
