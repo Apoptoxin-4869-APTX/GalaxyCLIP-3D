@@ -31,7 +31,7 @@
 set -uo pipefail
 PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
 DEST="${DEST:-/cluster/projects/ska/illustris/tng50-1.snap099}"
-WORKERS="${WORKERS:-4}"
+WORKERS="${WORKERS:-25}"
 mkdir -p "${PROJECT_DIR}/slurm/log"
 
 # ── Requeue: forward SIGUSR1 to python (it stops at the next block), then requeue
