@@ -7,7 +7,9 @@ galaxies** in one embedding space.
 
 ## Data (ZHAW cluster)
 
-`/cluster/projects/ska/illustris/tng50-1.3D/`, snapshot 99 (z = 0):
+`/cluster/projects/ska/illustris/tng50-1.3D/`, snapshot 99 (z = 0). These are the 3D sets prepared before this
+project, 1,000 central galaxies each; our own dataset, built from the raw snapshot, is the point-cloud dataset v3
+below.
 
 | Set | Points per particle type | Subhalos (train / val / test) |
 |---|---|---|
@@ -44,14 +46,42 @@ these 1,000 halos), otherwise one side has seen the "held-out" galaxies.
 ### Planned route to 2D↔3D alignment
 Keep the trained 2D model frozen, export its embeddings keyed by `(snapshot, gid, view)`, and
 train the 3D encoder to match them (anchor / ImageBind-style). The repos then only share an
-embedding file. To keep that possible, every 3D sample should carry `(snapshot, halo)`, and the
-3D embeddings should follow the 2D conventions: 512-d, L2-normalized, InfoNCE with τ = 0.07.
+embedding file. For that, every item of the point-cloud dataset v3 carries `snapshot`, `group` (= the 2D `gid` at
+that snapshot) and `subhalo`, and the 3D embeddings should follow the 2D conventions: 512-d, L2-normalized, InfoNCE
+with τ = 0.07.
 
-## Raw snapshot 99 — source for new point clouds
+## Raw snapshots — source for new point clouds
 
-New point clouds are to be extracted from the raw TNG50-1 data at
-`/cluster/projects/ska/illustris/tng50-1/` (`snapshots/099/`, `groupcats/099/`,
-`offsets/offsets_099.hdf5`). Audit from `tools/audit_snapshot.py`, 2026-10-27:
+**Complete copy (the one to use):** `/cluster/projects/ska/illustris/tng50-1.new/` holds snapshot 99 complete, laid
+out as `snapshots/099/` (680 files, 2.92 TB), `groupcats/099/` (680 files) and `offsets/offsets_099.hdf5`; the folder
+can hold several snapshots side by side. It was downloaded on 2026-11-02 with our own `tools/download_snapshot.py`
+(SLURM job 160622, 25 files in parallel, 5 h 44 min; 731 refused requests retried, none failed) and checked on
+2026-11-09: all 1,361 files present with the server's sizes, 9 files re-hashed against TNG's checksums, and
+`tools/audit_snapshot.py --root` finds no unreadable particle and all 2,991 halos with 2D maps complete.
+
+```bash
+env -u SLURM_JOB_ID sbatch slurm/download_snapshot.submit --snap N                       # download snapshot N
+python3 tools/download_snapshot.py status --dest /cluster/projects/ska/illustris/tng50-1.new --snap N --watch 10
+```
+
+Downloading needs a personal TNG API key in `~/.tng_api_key` (mode 600). The TNG data server often refuses valid
+requests for about a minute (HTTP 403 or 504); the downloader retries them.
+
+**Storage limit.** `/cluster/projects/ska` has a **10 TiB quota shared by the whole ska group**. `df` shows the 175 TB
+filesystem instead, and so does the downloader's free-space check, which therefore cannot see the quota. A full
+snapshot is 2.93 TB. On 2026-11-09 a download of snapshot 91 filled the quota at 29% (850 GB), which blocked writes
+for everyone in the group until it was deleted. Usage afterwards: 10.145 of 10.995 TB (851 GB free), of which
+`tng50-1.new` 2.93 TB, the older copy 2.47 TB, `tng50-1.2D` 1.92 TB, `tng50-1.3D` 1.63 TB, the point clouds
+0.05 TB and other ska data 1.15 TB. To see what is really free:
+
+```bash
+python3 -c "import os; d='/cluster/projects/ska'; q=int(os.getxattr(d,'ceph.quota.max_bytes')); u=int(os.getxattr(d,'ceph.dir.rbytes')); print(f'{(q-u)/1e9:,.0f} GB free')"
+```
+
+### The older copy (incomplete)
+
+`/cluster/projects/ska/illustris/tng50-1/` (`snapshots/099/`, `groupcats/099/`, `offsets/offsets_099.hdf5`) is
+another user's download, which this project leaves untouched. Audit from `tools/audit_snapshot.py`, 2026-10-27:
 
 **The snapshot is incomplete.** 108 of its 680 files were never downloaded and
 `snap_099.657.hdf5` is truncated, so 109 files (~16 % of every particle type) are unreadable.
@@ -68,11 +98,9 @@ Particles are stored in FoF-group order, so the gaps remove whole blocks of spec
 
 Gas is complete for all of them; stars are incomplete for 1,975 halos, dark matter for 244 and
 black holes for 504. Per-halo table: `data/snap099_halo_availability.csv` (FoF particle counts,
-unreadable particles per type, 2D cube half-width, box-edge flag). Ways to complete them, both
-needing a personal TNG API key (the original download job used another user's):
-
-- per-halo API cutouts of the incomplete types — stars 368 M + dark matter 44 M particles, **~24 GB**;
-- re-downloading the 109 files — **~469 GB**, completes the whole box.
+unreadable particles per type, 2D cube half-width, box-edge flag). The complete copy above replaced it as the source
+of new point clouds, and the point-cloud build reads that one; `tools/audit_snapshot.py` and
+`tools/check_2d_selection.py` still default to this older copy (both take `--root`).
 
 ### How the 2D maps select particles
 
@@ -143,6 +171,36 @@ selected, step by step with counts: **`SELECTION.md`**.
 Where every file lives: `galaxyclip3d/pointclouds/layout.py`. The build needs only numpy and h5py (`pylibs/`, see
 `DATASET.md`); the loader needs torch. `tests/test_pointclouds.py` runs the whole pipeline on two synthetic snapshots,
 adding the second to a dataset built from the first.
+
+**Adding a snapshot.** For snapshot S: download it, run `tools/build_selection.py --snap S` (about 8 minutes, mostly
+fetching merger-tree branches from the TNG API), the SLURM shard job with `SNAP=S` (10–25 minutes), then
+`tools/finalize_pointclouds.py --snap S` and `tools/check_pointclouds.py --snap S`, and delete the raw snapshot;
+the commands are in `DATASET.md`. Each snapshot adds about 47 GB of point clouds. A raw snapshot needs 2.93 TB, more
+than the 851 GB free in ska, so the next one fits only after snapshot 99's raw copy is deleted.
+
+**Masked modalities.** Gas and HI are switched off for a galaxy whose sphere holds too little gas: gas below 4,096
+cells, HI below 512 effective cells. At 5 radii that is 1,574 of the 5,071 usable galaxies for gas (31%) and 962 for
+HI (19%). 678 (13%) have no gas at all, 626 of them satellites whose gas their host stripped; small galaxies are hit
+most (gas off for 44% below 10⁹ solar masses, 5% above 10¹¹). The loader returns a masked cloud as zeros with its
+`mask` entry false, so the loss can skip it; `gas_required=True` drops these galaxies instead (3,497 left). The QA PDF
+draws clouds without this rule, so it says "nothing to draw" only for galaxies with no gas at all.
+
+**Storage cap.** 916 galaxies (17%) have more than 262,144 particles of one type inside the stored sphere (stars 697,
+dark matter 762, gas 321). For them a random subset is stored: each particle is kept with a probability proportional
+to its draw weight (mass for stars, equal for dark matter, half mass and half HI mass for gas), and `wcorr` = 1 / that
+probability keeps the draws unbiased (`SELECTION.md`, step 2.5). The number kept varies by a few hundred around the
+cap, and the thinning ignores position, so the centre is thinned as much as the outskirts. `tools/cap_study.py`
+measured what this costs on 60 capped galaxies read in full: at 5 radii the median error is 0.04–0.10 of the spread
+between two clouds of the same galaxy (at most about 1% extra noise), the 90th percentile at most 0.14; at 2 radii it
+reaches 0.08–0.17 (90th percentile up to 0.32 for gas). A cap of 2¹⁹ would take 59.5 GB instead of 46.6 GB for
+little gain.
+
+| Analysis tool | Shows | Pictures (local, `outputs/` is not in git) |
+|---|---|---|
+| `tools/plot_clouds.py` | a galaxy's four clouds in 3D, coloured by age, speed, temperature and HI rotation | `outputs/pointcloud_examples/` |
+| `tools/compare_radii.py` | clouds drawn at several sphere sizes (e.g. 5, 10, 15 radii; beyond 10 read from the raw snapshot) | `outputs/radius_comparison/` |
+| `tools/cap_study.py` | particles per galaxy, and what each storage cap from 2¹² to 2²³ costs in size and accuracy | `outputs/cap_study/` |
+| `tools/check_pointclouds.py --pdf` | one drawn cloud per modality for 12 galaxies across stellar mass | `snap_NNN/qa_clouds.pdf` in the dataset |
 
 ## Code shared with GalaxyCLIP-2D
 
