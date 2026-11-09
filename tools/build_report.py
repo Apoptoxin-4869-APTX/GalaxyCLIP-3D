@@ -48,6 +48,16 @@ STYLES = {
     "small": ParagraphStyle("small", fontName="DejaVu", fontSize=8, leading=11, textColor=INK2),
 }
 IMG_W = 174 * mm
+MAX_CELLS = 5_000_000           # tools/collect_histogram_data.py --max-cells default: larger halos are not sampled
+OLD_COMPLETE = 730              # 2D halos complete in the original, partly downloaded copy (README)
+
+
+def all_complete(d) -> bool:
+    return bool((d["avail_complete"] == 1).all())
+
+
+def in_sample(d) -> np.ndarray:
+    return np.isin(d["avail_gid"], d["sample_gid"])
 
 
 # ---------------------------------------------------------------- number helpers
@@ -94,11 +104,14 @@ def texts_2d(d):
     share, gf = stellar_share(d), gas_fraction(d)
     okh = (hi > 0) & (ms > 0)
     hs = np.log10(hi[okh] / ms[okh])
+    sample = in_sample(d)
+    big = (d["avail_n_gas"] > MAX_CELLS) | (d["avail_n_stars"] > MAX_CELLS)
+    cand = ~big & (d["avail_crosses_box_edge"] == 0)
     return {
         "points": (
             "Points inside the 2D cube",
             f"How many particles of each type the 2D maps contain, read from the maps' metadata (unrotated view), "
-            f"so the numbers are exact even for halos whose snapshot files are missing locally. The median halo has "
+            f"so these are exactly the particles behind each map. The median halo has "
             f"{q(pts['gas'], 50):,.0f} gas cells, {q(pts['dm'], 50):,.0f} dark-matter particles and "
             f"{q(pts['star'], 50):,.0f} star particles in its cube. Stars are the binding constraint for a "
             f"fixed-size point cloud: {(pts['star'] < 2048).sum()} halos have fewer than 2,048 star particles, "
@@ -114,7 +127,16 @@ def texts_2d(d):
             f"{(hi < 1e7).sum()} less than 10<super>7</super> M☉; for those, sampling points in proportion to HI "
             f"mass will draw repeatedly from a few cells. The HI modality is usable for essentially every 2D halo."),
         "halo_mass": (
-            "Halo mass, complete versus incomplete on disk",
+            "Halo mass, and the particle sample",
+            f"Halo mass M200c of all {comp.sum():,} halos with 2D maps (blue), every one of them now complete on "
+            f"disk (only {OLD_COMPLETE} were before the new download), and of the {sample.sum()} halos in the "
+            f"particle sample of sections C and D (orange); counts are on a log scale. The 2D set spans log M200c "
+            f"{m200.min():.1f} to {m200.max():.1f} (median {np.median(m200):.2f}). The sample takes ten halos from "
+            f"each sixth of the mass distribution, so it follows the 2D set, but nothing above log M200c "
+            f"{m200[cand].max():.1f}: the {big.sum()} halos with more than {MAX_CELLS / 1e6:.0f} million gas cells "
+            f"or star particles were left out to keep the particle run short, as were the "
+            f"{(d['avail_crosses_box_edge'] == 1).sum()} whose cube crosses the box edge."
+            if comp.all() else
             f"Halo mass M200c for halos whose particles are all on disk (blue, {comp.sum()}) and halos missing at "
             f"least one particle type (orange, {(~comp).sum():,}). The complete subset is strongly biased towards "
             f"massive halos (median log M200c {np.median(m200[comp]):.2f} versus {np.median(m200[~comp]):.2f}), and "
@@ -193,6 +215,11 @@ def texts_all(d, d2):
     share, gf = stellar_share(d), gas_fraction(d)
     cube_frac = d2["halo_npts_gas"] / d2["avail_n_gas"]
     first_complete = np.nanmin(m200[comp])
+    sample = in_sample(d)
+    cand_m = m200[comp & (d["avail_crosses_box_edge"] == 0) & (d["avail_n_gas"] <= MAX_CELLS)
+                  & (d["avail_n_stars"] <= MAX_CELLS) & (ms >= 1e7)]
+    cand_m = cand_m[np.isfinite(cand_m)]
+    low = int((cand_m < cand_m.min() + (cand_m.max() - cand_m.min()) / 6).sum())
     return {
         "central_stars": (
             "Star particles in the central galaxy",
@@ -259,7 +286,18 @@ def texts_all(d, d2):
             f"({(gf > 0.9).sum():,} with a gas fraction above 0.9, the gas-rich dwarfs) and centrals with no gas "
             f"inside 2 R<sub>1/2,*</sub> ({(gf < 0.01).sum():,})."),
         "complete": (
-            "Halos complete on disk",
+            "Halo mass of the second particle sample",
+            f"Halo mass of all {n:,} halos with a galaxy (blue) and of the {sample.sum()} halos in a second particle "
+            f"sample (orange). It was drawn from halos whose central has at least 10<super>7</super> M☉ of stars, "
+            f"up to ten from each of six equal-width bins in log M200c between {cand_m.min():.1f} and "
+            f"{cand_m.max():.1f}" + (f"; the lowest bin held only {low} such halo{'' if low == 1 else 's'}"
+                                     if low < 10 else "") +
+            f". {(sample & ~in2d).sum()} of the sampled halos have no 2D maps. Section E compares this "
+            f"sample with the one used in sections C and D. Every halo is now complete on disk; with the original "
+            f"copy only {OLD_COMPLETE} were, all of them with 2D maps, so a sample like this was not possible. "
+            f"{(d['avail_crosses_box_edge'] == 1).sum()} cubes cross the box edge "
+            f"({(d['avail_crosses_box_edge'][in2d] == 1).sum()} in the 2D set)."
+            if comp.all() else
             f"Share of halos whose particles are all on disk, versus halo mass. No halo below log M200c "
             f"{first_complete:.1f} is complete, and all {comp.sum()} complete halos have 2D maps: the stars of "
             f"every other halo sit in snapshot files 621–678 and their dark matter in files 241–356, where most of "
@@ -292,24 +330,28 @@ def texts_gas(d):
         "lognH": (
             "Hydrogen number density",
             f"Star-forming gas begins sharply at n<sub>H</sub> ≈ 0.1 cm<super>-3</super>, TNG's star-formation "
-            f"threshold. Non-star-forming gas has two peaks: diffuse halo gas near "
-            f"10<super>{wmode(h('lognH', 'nonsf'), e('lognH'), hi=-3):.1f}</super> cm<super>-3</super> and denser "
-            f"gas just below the threshold near 10<super>{wmode(h('lognH', 'nonsf'), e('lognH'), lo=-3):.1f}</super> "
-            f"cm<super>-3</super>. The cube therefore contains both the galaxy's interstellar medium and a large "
-            f"amount of circumgalactic gas."),
+            f"threshold. Non-star-forming gas has three parts: diffuse halo gas peaking near "
+            f"10<super>{wmode(h('lognH', 'nonsf'), e('lognH'), hi=-3):.1f}</super> cm<super>-3</super>, a broad hump "
+            f"around 10<super>{wmode(h('lognH', 'nonsf'), e('lognH'), lo=-3, hi=-1.2):.1f}</super> "
+            f"cm<super>-3</super> and a spike just below the threshold at "
+            f"10<super>{wmode(h('lognH', 'nonsf'), e('lognH'), lo=-1.2):.1f}</super> cm<super>-3</super>. The cube "
+            f"therefore contains both the galaxy's interstellar medium and a large amount of circumgalactic gas."),
         "logB_uG": (
             "Magnetic field strength",
             f"Mass-weighted median field strengths are "
             f"{10 ** wquantile(h('logB_uG', 'nonsf'), e('logB_uG'), 0.5):.1f} µG for non-star-forming gas and "
             f"{10 ** wquantile(h('logB_uG', 'sf'), e('logB_uG'), 0.5):.1f} µG for star-forming gas, with a tail of "
-            f"weakly magnetised diffuse gas down to about 10<super>-2</super> µG. The field spans roughly four "
+            f"weakly magnetised diffuse gas: 1% of the gas mass lies below "
+            f"{10 ** wquantile(both('logB_uG'), e('logB_uG'), 0.01):.2g} µG. The middle 98% of the gas mass spans "
+            f"{wquantile(both('logB_uG'), e('logB_uG'), 0.99) - wquantile(both('logB_uG'), e('logB_uG'), 0.01):.1f} "
             f"decades, so |B| should enter the model on a log scale."),
         "xHI": (
             "Neutral hydrogen fraction",
             f"Non-star-forming gas is close to all-or-nothing: {wfrac(both('xHI'), e('xHI'), hi=0.1):.0%} of all "
             f"gas mass is almost fully ionised (x<sub>HI</sub> &lt; 0.1) and {wfrac(both('xHI'), e('xHI'), lo=0.9):.0%} "
             f"almost fully neutral (&gt; 0.9). Star-forming gas is never fully neutral: its x<sub>HI</sub> spreads "
-            f"between 0 and about 0.7 (mass-weighted median {wquantile(h('xHI', 'sf'), e('xHI'), 0.5):.2f}; "
+            f"between 0 and {e('xHI')[1:][h('xHI', 'sf') > 0].max():.2f} (mass-weighted median "
+            f"{wquantile(h('xHI', 'sf'), e('xHI'), 0.5):.2f}; "
             f"{wfrac(h('xHI', 'sf'), e('xHI'), hi=0.1):.0%} of it below 0.1), set by the sub-grid model rather "
             f"than resolved physics. The HI modality inherits this approximation, as do the 2D HI maps."),
         "logZ": (
@@ -317,7 +359,10 @@ def texts_gas(d):
             f"Star-forming gas is the most enriched (mass-weighted median "
             f"{10 ** wquantile(h('logZ', 'sf'), e('logZ'), 0.5):.2f} Z☉) and the surrounding gas less so "
             f"(median {10 ** wquantile(h('logZ', 'nonsf'), e('logZ'), 0.5):.2f} Z☉), with a tail of nearly pristine "
-            f"gas. No cell in the sample has zero metallicity, so a log transform is safe."),
+            f"gas. " + ("No cell in the sample has zero metallicity, so a log transform is safe."
+                        if d["sample_zero_Z_gas"].sum() == 0 else
+                        f"{int(d['sample_zero_Z_gas'].sum()):,} cells in the sample have zero metallicity "
+                        f"(in {int((d['sample_zero_Z_gas'] > 0).sum())} halos), so a log transform needs a floor.")),
         "logr_kpc": (
             "Gas cell size",
             f"Radius of a sphere with the cell's volume. Star-forming cells have a median radius of "
@@ -353,8 +398,9 @@ def texts_stars(d):
             f"stellar mass) are stars with essentially no metals, formed early from nearly pristine gas."),
         "mass_loss": (
             "Current versus birth mass of star particles",
-            f"Current mass of each star particle relative to its mass at birth. Most particles have lost about 40% "
-            f"(peak at {wmode(hm, em):.2f}) through stellar winds and supernovae; young particles have lost less. "
+            f"Current mass of each star particle relative to its mass at birth. Most particles have lost about "
+            f"{1 - wmode(hm, em):.0%} (peak at {wmode(hm, em):.2f}) through stellar winds and supernovae; young "
+            f"particles have lost less. "
             f"Sampling stars by current mass therefore gives old stars slightly less weight than sampling by birth "
             f"mass would."),
         "wind": (
@@ -406,7 +452,82 @@ def sf_share(d):
     return sf / (sf + d["hist_logT_nonsf"].sum())
 
 
-def summary(story, d, da):
+def sample_groups(d2, da):
+    """(name, halos, log M200c, per-halo sample arrays) for the C/D sample and both halves of the all-mass one."""
+    out = []
+    for name, d, keep in (("Sample of C and D (2D maps)", d2, None),
+                          ("All-mass sample, with 2D maps", da, True),
+                          ("All-mass sample, without 2D maps", da, False)):
+        idx = np.searchsorted(d["avail_gid"], d["sample_gid"])
+        sel = np.ones(idx.size, bool) if keep is None else (d["avail_in_2d"][idx] == 1) == keep
+        out.append((name, int(sel.sum()), np.log10(d["halo_m200c"][idx][sel]),
+                    {k[7:]: v[sel] for k, v in d.items() if k.startswith("sample_")}))
+    return out
+
+
+def comparison(story, d2, da, letter):
+    groups = sample_groups(d2, da)
+    cell = ParagraphStyle("cell", parent=STYLES["body"], alignment=0, spaceAfter=0, fontSize=8.5, leading=11)
+    rows = [["", *(g[0] for g in groups)],
+            ["Halos", *(f"{n}" for _, n, _, _ in groups)],
+            ["log M200c range", *(f"{m.min():.1f}–{m.max():.1f}" for _, _, m, _ in groups)]]
+    for label, fn in (
+            ("Median gas cells in the cube", lambda s: f"{np.median(s['n_gas_cube']):,.0f}"),
+            ("Median star particles in the cube", lambda s: f"{np.median(s['n_star_cube']):,.0f}"),
+            ("Halos with &lt; 2,048 star particles in the cube", lambda s: f"{(s['n_star_cube'] < 2048).sum()}"),
+            ("Median star-forming share of the gas mass", lambda s: f"{np.median(s['sf_mass_frac']):.1%}"),
+            ("Halos without star-forming gas", lambda s: f"{(s['sf_mass_frac'] == 0).sum()}"),
+            ("Median neutral-hydrogen share of the gas mass", lambda s: f"{np.median(s['hi_mass_frac']):.0%}"),
+            ("Median cold-gas share (T &lt; 10<super>4.5</super> K)", lambda s: f"{np.median(s['cold_mass_frac']):.0%}"),
+            ("Median wind share of PartType4 mass", lambda s: f"{np.median(s['wind_mass_frac']):.2%}"),
+            ("Halos with zero-metallicity gas", lambda s: f"{(s['zero_Z_gas'] > 0).sum()}")):
+        rows.append([label, *(fn(s) for _, _, _, s in groups)])
+    rows = [[Paragraph(c if i and j else f"<b>{c}</b>", cell) for j, c in enumerate(r)] for i, r in enumerate(rows)]
+    t = Table(rows, colWidths=[62 * mm, 37 * mm, 37 * mm, 38 * mm])
+    t.setStyle(TableStyle([
+        ("TEXTCOLOR", (0, 0), (-1, -1), INK),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#c3c2b7")),
+        ("LINEBELOW", (0, 1), (-1, -1), 0.3, colors.HexColor("#e1e0d9")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    (_, n2, m2, s2), (_, _, m1, s1), (_, n0, m0, s0) = groups
+    heavier = (f"The all-mass sample's halos with 2D maps are more massive than the sample of C and D (median log "
+               f"M200c {np.median(m1):.1f} versus {np.median(m2):.1f}), because equal-width mass bins give the rare "
+               f"massive halos as much weight as the common small ones"
+               + ("; their gas is correspondingly hotter and less neutral. "
+                  if np.median(s1["cold_mass_frac"]) < np.median(s2["cold_mass_frac"])
+                  and np.median(s1["hi_mass_frac"]) < np.median(s2["hi_mass_frac"]) else ". "))
+    in2d, ns = da["avail_in_2d"] == 1, da["halo_ncen_star"]
+    big_outside = in_sample(da) & ~in2d & (ns >= 2048)
+    zero_z = sum(int((s["zero_Z_gas"] > 0).sum()) for _, _, _, s in groups)
+    story.append(Paragraph(f"{letter}. Particles across all halo masses", STYLES["h1"]))
+    story.append(Paragraph(
+        "Sections C and D describe halos with 2D maps. Now that every halo is complete on disk, a second particle "
+        f"sample of {len(da['sample_gid'])} halos was drawn evenly in halo mass over all halos with a galaxy (panel "
+        "B12), including many without 2D maps. The table compares the two samples halo by halo.", STYLES["body"]))
+    story.append(t)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(
+        heavier +
+        f"The {n0} sampled halos without 2D maps (log M200c {m0.min():.1f}–{m0.max():.1f}) are small: their cubes "
+        f"hold a median of {np.median(s0['n_gas_cube']):,.0f} gas cells and {np.median(s0['n_star_cube']):,.0f} star "
+        f"particles, and {(s0['n_star_cube'] < 2048).sum()} of the {n0} have fewer than 2,048 star particles, so the "
+        f"star-count filter in the summary would remove them. Their median star-forming share of the gas mass is "
+        f"{np.median(s0['sf_mass_frac']):.1%} (sample of C and D: {np.median(s2['sf_mass_frac']):.1%}), and "
+        f"{(s0['sf_mass_frac'] == 0).sum()} have no star-forming gas at all. Their median neutral-hydrogen and "
+        f"cold-gas shares are {np.median(s0['hi_mass_frac']):.0%} and {np.median(s0['cold_mass_frac']):.0%} "
+        f"(sample of C and D: {np.median(s2['hi_mass_frac']):.0%} and {np.median(s2['cold_mass_frac']):.0%}). "
+        f"Wind cells remain a negligible share of PartType4 everywhere, and "
+        + ("no sampled halo has gas with zero metallicity." if zero_z == 0 else
+           f"{zero_z} sampled halos have gas with zero metallicity.") +
+        f" Because the sample was drawn by halo mass, it says little about the {((ns >= 2048) & ~in2d).sum():,} "
+        f"halos without 2D maps whose central galaxy does have at least 2,048 star particles: only "
+        f"{big_outside.sum()} of them are in it.", STYLES["body"]))
+    story.append(PageBreak())
+
+
+def summary(story, d, da, letter="E"):
     hw = d["avail_half_width_kpc"]
     pts = d["halo_npts_star"]
     share = stellar_share(d)
@@ -437,20 +558,33 @@ def summary(story, d, da):
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
-    story.append(Paragraph("E. Summary: candidate filters", STYLES["h1"]))
+    story.append(Paragraph(f"{letter}. Summary: candidate filters", STYLES["h1"]))
     story.append(Paragraph(
         "Halo-level candidates for the 2,991 halos with 2D maps, from sections A and B. The first three rows are "
         "the recommended set.", STYLES["body"]))
     story.append(t)
     story.append(Spacer(1, 8))
+    particles = ("At particle level (sections C and D): drop wind cells; keep star-forming gas but add a per-point "
+                 "star-forming flag; no filter is needed on cell mass or metallicity. Star clouds probably need their "
+                 "own spatial scaling because stars occupy only the central few per cent of the cube.")
+    extra = (da["avail_in_2d"] == 0) & (da["halo_ncen_star"] >= 2048)
+    if all_complete(d) and all_complete(da):
+        story.append(Paragraph(
+            f"The recommended set removes {base.sum()} halos and keeps {(~base).sum():,}, all of them complete on "
+            f"disk. Adding the merger filter keeps {(~(base | (share < 0.5))).sum():,}. {particles}", STYLES["body"]))
+        _, _, (_, n0, _, s0) = sample_groups(d, da)
+        story.append(Paragraph(
+            f"Outside the 2D set, {extra.sum():,} halos have at least 2,048 star particles in their central galaxy. "
+            f"They have no 2D maps, so they could only be used for 3D-only training; all their particles are now on "
+            f"disk. Most other halos are too small for point clouds under the 2D cube rule: in the all-mass sample of "
+            f"section E, {(s0['n_star_cube'] < 2048).sum()} of the {n0} halos without 2D maps have fewer than 2,048 "
+            f"star particles in their cube.", STYLES["body"]))
+        return
     story.append(Paragraph(
         f"The recommended set removes {base.sum()} halos and keeps {(~base).sum():,}, of which "
         f"{(comp & ~base).sum()} are complete on disk today. Adding the merger filter keeps "
-        f"{(~(base | (share < 0.5))).sum():,} ({(comp & ~(base | (share < 0.5))).sum()} complete). At particle level "
-        f"(sections C and D): drop wind cells; keep star-forming gas but add a per-point star-forming flag; no "
-        f"filter is needed on cell mass or metallicity. Star clouds probably need their own spatial scaling "
-        f"because stars occupy only the central few per cent of the cube.", STYLES["body"]))
-    extra = (da["avail_in_2d"] == 0) & (da["halo_ncen_star"] >= 2048)
+        f"{(~(base | (share < 0.5))).sum():,} ({(comp & ~(base | (share < 0.5))).sum()} complete). {particles}",
+        STYLES["body"]))
     gb = (da["avail_n_stars"][extra].sum() * 60 + da["avail_n_dm"][extra].sum() * 44) / 1e9
     story.append(Paragraph(
         f"Outside the 2D set, {extra.sum():,} halos have at least 2,048 star particles in their central galaxy. "
@@ -464,20 +598,32 @@ def main():
     img_dir = out.parent / "report_panels"
     panels = {"A": halo_panels(d2), "B": all_halo_panels(da), "C": gas_panels(d2), "D": star_panels(d2)}
     images = {s: render_each(p, img_dir, s) for s, p in panels.items()}
+    complete = all_complete(d2) and all_complete(da)
+    ng = len(d2["sample_gid"])
+    big2 = (d2["avail_n_gas"] > MAX_CELLS) | (d2["avail_n_stars"] > MAX_CELLS)
 
     doc = SimpleDocTemplate(str(out), pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
                             topMargin=16 * mm, bottomMargin=16 * mm,
                             title="GalaxyCLIP-3D: TNG50-1 snapshot 99 data distributions", author="GalaxyCLIP-3D")
     story = [
         Paragraph("TNG50-1 snapshot 99: data distributions for choosing filters", STYLES["title"]),
-        Paragraph(f"GalaxyCLIP-3D · {datetime.date.today():%Y-%m-%d} · generated by tools/build_report.py",
+        Paragraph(f"GalaxyCLIP-3D · {datetime.date.today():%Y-%m-%d} · "
+                  + ("complete snapshot copy · " if complete else "") + "generated by tools/build_report.py",
                   STYLES["subtitle"]),
         Paragraph(
             "This document shows every histogram used to decide how to filter the 3D point-cloud dataset, each with "
-            "a short explanation. The data are TNG50-1 at redshift zero. The local copy of the snapshot is "
-            f"incomplete (108 of its 680 files were never downloaded and one is truncated), so only "
-            f"{(d2['avail_complete'] == 1).sum()} of the {len(d2['avail_gid']):,} halos with 2D maps have all their "
-            f"particles on disk.", STYLES["body"]),
+            "a short explanation. The data are TNG50-1 at redshift zero. "
+            + ("They come from a fresh, complete download of snapshot 99: all 680 snapshot files and the group "
+               "catalog, each file checked against its sha256 checksum, plus the offsets file. Every halo therefore "
+               "has all of its particles on disk. An earlier version of this report used the original local copy, "
+               f"in which 109 snapshot files were missing or truncated and only {OLD_COMPLETE} of the 2,991 halos "
+               "with 2D maps were complete. Sections A and B do not depend on the snapshot files and are unchanged "
+               "apart from panels A3 and B12. Sections C and D now use a particle sample that represents the whole "
+               "2D set, and the new section E adds halos of all masses."
+               if complete else
+               "The local copy of the snapshot is incomplete (108 of its 680 files were never downloaded and one is "
+               f"truncated), so only {(d2['avail_complete'] == 1).sum()} of the {len(d2['avail_gid']):,} halos with "
+               "2D maps have all their particles on disk."), STYLES["body"]),
         Paragraph(
             "<b>The cube.</b> Each 2D map shows the halo's friends-of-friends (FoF) particles inside a cube centred "
             "on the central galaxy, with half-width equal to the central's gas half-mass radius. The 3D point clouds "
@@ -486,17 +632,26 @@ def main():
             "<b>Populations.</b> Section A covers the 2,991 halos with 2D maps; points and HI in the cube come from "
             "the 2D map metadata and are exact for every halo. Section B compares them with all 36,057 halos whose "
             "central galaxy contains gas and stars; there, particle counts come from the group catalog because "
-            "there are no maps. Sections C and D use the particles of 60 halos that are complete on disk, chosen "
-            "evenly across their mass range; every complete halo has 2D maps, so these sections describe the "
-            f"massive end only. A second, independently drawn sample gave the same picture (star-forming share of "
-            f"the gas mass {sf_share(da):.1%} versus {sf_share(d2):.1%}).", STYLES["body"]),
+            "there are no maps. "
+            + (f"Sections C and D use the particles of {ng} halos with 2D maps, ten from each sixth of the set's "
+               f"mass distribution, so they represent the 2D set apart from its {big2.sum()} most particle-rich "
+               f"halos. Section E compares them with a second sample of {len(da['sample_gid'])} halos spread evenly "
+               f"in halo mass over all halos with a galaxy, {(~np.isin(da['sample_gid'], d2['avail_gid'])).sum()} "
+               "of them without 2D maps."
+               if complete else
+               f"Sections C and D use the particles of {ng} halos that are complete on disk, chosen evenly across "
+               "their mass range; every complete halo has 2D maps, so these sections describe the massive end "
+               f"only. A second, independently drawn sample gave the same picture (star-forming share of the gas "
+               f"mass {sf_share(da):.1%} versus {sf_share(d2):.1%})."), STYLES["body"]),
         Paragraph(
-            "<b>Reading the graphs.</b> Blue is the main population and orange the comparison (2D set, incomplete "
-            "halos or star-forming gas, as labelled). Section B uses logarithmic counts so both populations are "
+            "<b>Reading the graphs.</b> Blue is the main population and orange the comparison ("
+            + ("2D set, particle sample" if complete else "2D set, incomplete halos") +
+            " or star-forming gas, as labelled). Section B uses logarithmic counts so both populations are "
             "visible. Gas histograms in section C are weighted by mass, so they show where the gas mass is, which "
             "is what mass-weighted point sampling would draw from.", STYLES["body"]),
         Spacer(1, 6),
     ]
+    which = f"{ng} halos with 2D maps" if complete else f"{ng} complete halos"
     section(story, "A. Halos with 2D maps (2,991)",
             "Halo-level properties of the 2,991 halos at snapshot 99 that have 2D maps in GalaxyCLIP-2D.",
             panels["A"], texts_2d(d2), images["A"], "A")
@@ -504,15 +659,18 @@ def main():
             "The same properties for every halo whose central galaxy contains gas and at least one star particle "
             "(blue), with the 2D set overlaid (orange). Counts are on a log scale.",
             panels["B"], texts_all(da, d2), images["B"], "B")
-    section(story, "C. Gas cells inside the cube (60 complete halos)",
-            "Mass-weighted distributions of gas-cell properties, summed over the cubes of 60 halos that are "
-            "complete on disk, split into star-forming and non-star-forming gas.",
+    section(story, f"C. Gas cells inside the cube ({which})",
+            f"Mass-weighted distributions of gas-cell properties, summed over the cubes of {which}"
+            + (", ten from each sixth of the set's mass distribution" if complete else ", all complete on disk")
+            + ", split into star-forming and non-star-forming gas.",
             panels["C"], texts_gas(d2), images["C"], "C")
-    section(story, "D. Star particles and per-halo fractions (60 complete halos)",
-            "Star-particle distributions for the same 60 halos, and per-halo fractions that describe how each "
+    section(story, f"D. Star particles and per-halo fractions ({which})",
+            f"Star-particle distributions for the same {ng} halos, and per-halo fractions that describe how each "
             "cube's gas and PartType4 content is composed.",
             panels["D"], texts_stars(d2), images["D"], "D")
-    summary(story, d2, da)
+    if complete:
+        comparison(story, d2, da, "E")
+    summary(story, d2, da, "F" if complete else "E")
 
     def footer(canvas, doc_):
         canvas.saveState()

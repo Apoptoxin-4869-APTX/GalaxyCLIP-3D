@@ -111,6 +111,15 @@ def halo_panels(d):
 
     def halo_mass(ax):
         m200, e = np.log10(d["halo_m200c"]), np.arange(10.4, 14.41, 0.1)
+        if comp.all():          # nothing missing: show where the particle sample of sections C and D lies
+            sample = np.isin(d["avail_gid"], d["sample_gid"])
+            steps(ax, np.histogram(m200, e)[0], e, BLUE, f"all, each complete on disk ({comp.sum():,})", baseline=0.5)
+            steps(ax, np.histogram(m200[sample], e)[0], e, ORANGE, f"particle sample ({sample.sum()})", baseline=0.5)
+            ax.set_yscale("log")
+            ax.set_ylim(0.5, None)
+            legend(ax, "upper right")
+            style(ax, "Halo mass", "log10 M200c [M☉]", "halos (log scale)")
+            return
         steps(ax, np.histogram(m200[comp], e)[0], e, BLUE, f"complete on disk ({comp.sum()})")
         steps(ax, np.histogram(m200[~comp], e)[0], e, ORANGE, f"incomplete ({(~comp).sum()})")
         legend(ax, "upper right")
@@ -237,14 +246,26 @@ def all_halo_panels(d):
 
     def complete(ax):
         m, e = log(d["halo_m200c"]), np.arange(8.0, 14.51, 0.25)
+        note = (f"complete: {(d['avail_complete'] == 1).sum():,} of {n:,}\n"
+                f"cube crosses box edge: {(d['avail_crosses_box_edge'] == 1).sum():,}")
+        if (d["avail_complete"] == 1).all():    # nothing missing: show where the particle sample lies instead
+            sample = np.isin(d["avail_gid"], d["sample_gid"])
+            e = np.arange(8.0, 14.51, 0.1)
+            steps(ax, np.histogram(m[np.isfinite(m)], e)[0], e, BLUE, all_lbl, baseline=0.5)
+            steps(ax, np.histogram(m[sample], e)[0], e, ORANGE, f"particle sample ({sample.sum()})", baseline=0.5)
+            ax.set_yscale("log")
+            ax.set_ylim(0.5, None)
+            legend(ax, "upper right")
+            style(ax, "Halo mass of the particle sample", "log10 M200c [M☉]", "halos (log scale)", note=note,
+                  note_y=0.84)
+            return
         idx = np.digitize(m, e) - 1
         frac = np.array([np.mean(d["avail_complete"][idx == k]) if (idx == k).sum() >= 5 else np.nan
                          for k in range(len(e) - 1)])
         ax.plot(0.5 * (e[:-1] + e[1:]), 100 * frac, color=BLUE, linewidth=2)
         ax.set_ylim(0, 105)
-        style(ax, "Halos complete on disk", "log10 M200c [M☉]", "% of halos (bins with ≥ 5)",
-              note=f"complete: {(d['avail_complete'] == 1).sum():,} of {n:,}\n"
-                   f"cube crosses box edge: {(d['avail_crosses_box_edge'] == 1).sum():,}", note_left=True)
+        style(ax, "Halos complete on disk", "log10 M200c [M☉]", "% of halos (bins with ≥ 5)", note=note,
+              note_left=True)
 
     return [("central_stars", central_stars), ("fof_particles", fof_particles), ("halo_mass", halo_mass),
             ("stellar_mass", stellar_mass), ("ssfr", ssfr), ("half_width", half_width), ("hw_r200", hw_r200),
@@ -341,7 +362,9 @@ def render_each(panels, outdir: Path, prefix: str, figsize=(7.4, 3.5), dpi=200) 
 
 
 def sample_label(d):
-    return "(every complete halo has 2D maps)" if str(d["population"]) == "all" else "with 2D maps"
+    if str(d["population"]) != "all":
+        return "with 2D maps"
+    return "across all masses" if (d["avail_complete"] == 1).all() else "(every complete halo has 2D maps)"
 
 
 def report(d):
@@ -366,7 +389,10 @@ def report(d):
     print(f"subhalos per halo               : {pct(d['halo_nsubs'])}")
     comp = d["avail_complete"] == 1
     m = np.log10(d["halo_m200c"])
-    print(f"median log M200c complete/incomplete: {np.median(m[comp]):.2f} / {np.median(m[~comp]):.2f}")
+    if comp.all():
+        print(f"complete on disk                : all {comp.sum():,}")
+    else:
+        print(f"median log M200c complete/incomplete: {np.median(m[comp]):.2f} / {np.median(m[~comp]):.2f}")
     print(f"central SubhaloFlag == 0        : {int((d['halo_flag_cen'] == 0).sum())}")
     print("== gas cells (sample) ==")
     sf = d["hist_logT_sf"].sum()

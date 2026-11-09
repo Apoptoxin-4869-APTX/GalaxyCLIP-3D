@@ -2,7 +2,7 @@
 
 Two populations (--population):
   2d   the 2,991 halos with 2D maps. Halo level from the group catalog + 2D map metadata (so
-       independent of the missing snapshot files): points per modality inside the 2D cube
+       independent of which snapshot files are on disk): points per modality inside the 2D cube
        (num_particles of the unrotated gas/dm/star maps) and the HI mass inside the cube (sum
        of the unrotated 2D hi map), plus the catalog quantities below.
   all  every FoF halo whose central galaxy has gas and at least one star particle (~36k).
@@ -24,7 +24,8 @@ half-mass radius). For `all`, strata are equal-width in log M200c so low masses 
     python tools/collect_histogram_data.py --population 2d  --out outputs/data_audit/histogram_data.npz
     python tools/collect_histogram_data.py --population all --out outputs/data_audit/histogram_data_all.npz
 
-A few minutes each, < 4 GB of RAM.
+--root picks the snapshot copy (default: the original, incomplete one); completeness on disk is
+worked out from the files under it. A few minutes each, < 4 GB of RAM.
 """
 from __future__ import annotations
 
@@ -41,7 +42,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from audit_snapshot import BLOCKS_2D, load_groupcat, missing_counter, snapshot_files   # noqa: E402
 from check_2d_selection import ROOT, ROOT_2D, Snapshot                                    # noqa: E402
 
-AVAIL = Path(__file__).resolve().parents[1] / "data" / "snap099_halo_availability.csv"
 M_P, K_B, MSUN, KPC = 1.67262192e-24, 1.380649e-16, 1.98847e33, 3.0856776e21   # cgs
 X_H, Z_SUN, B_UNIT = 0.76, 0.0127, 2.60e-6         # H mass fraction, solar Z, code B -> Gauss
 BINS = {                                            # shared bin edges, stored with the output
@@ -122,9 +122,9 @@ def catalog_quantities(cat, gids, cen, h, a) -> dict[str, np.ndarray]:
     )
 
 
-def all_halos(cat, hd) -> dict[str, np.ndarray]:
-    """Availability table (same columns as data/snap099_halo_availability.csv) for every FoF halo
-    whose central galaxy has gas and at least one star particle."""
+def all_halos(cat, hd, root: str) -> dict[str, np.ndarray]:
+    """Availability table (the columns of data/snap099_halo_availability.csv, for the copy at `root`)
+    for every FoF halo whose central galaxy has gas and at least one star particle."""
     h, a, box = float(hd["HubbleParam"]), float(hd["Time"]), float(hd["BoxSize"])
     fs = cat["GroupFirstSub"]
     has = fs >= 0
@@ -133,9 +133,9 @@ def all_halos(cat, hd) -> dict[str, np.ndarray]:
     sel[has] = (cat["SubhaloHalfmassRadType"][c, 0] > 0) & (cat["SubhaloLenType"][c, 4] > 0)
     gids = np.flatnonzero(sel)
     cen = fs[gids]
-    _, unusable, _, _ = snapshot_files(ROOT, 99)
+    _, unusable, _, _ = snapshot_files(root, 99)
     ntot = hd["NumPart_Total"].astype(np.int64) + (hd["NumPart_Total_HighWord"].astype(np.int64) << 32)
-    with h5py.File(Path(ROOT) / "offsets" / "offsets_099.hdf5", "r") as f:
+    with h5py.File(Path(root) / "offsets" / "offsets_099.hdf5", "r") as f:
         fo = f["FileOffsets/SnapByType"][()]
         goff = f["Group/SnapByType"][()][gids].astype(np.int64)
     n_missing, _ = missing_counter(fo if fo.shape[1] == 6 else fo.T, ntot, unusable)
@@ -272,6 +272,7 @@ def particle_level(s, avail, cat, hd, pick):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--population", choices=["2d", "all"], default="2d")
+    ap.add_argument("--root", default=ROOT, help="snapshot copy with snapshots/, groupcats/ and offsets/")
     ap.add_argument("--out", type=Path, default=Path("outputs/data_audit/histogram_data.npz"))
     ap.add_argument("--per-bin", type=int, default=10, help="halos per M200c bin in the particle sample")
     ap.add_argument("--bins", type=int, default=6, help="M200c bins in the particle sample")
@@ -280,21 +281,21 @@ def main():
     ap.add_argument("--seed", type=int, default=4869)
     args = ap.parse_args()
 
-    s = Snapshot(ROOT, 99)
+    s = Snapshot(args.root, 99)
     with h5py.File(s.snap_file(0), "r") as f:
         hd = dict(f["Header"].attrs)
     h, a = float(hd["HubbleParam"]), float(hd["Time"])
-    print("loading group catalog", flush=True)
-    cat = load_groupcat(ROOT, 99, {"Group": GROUP_FIELDS, "Subhalo": SUBHALO_FIELDS})
+    print(f"loading group catalog from {args.root}", flush=True)
+    cat = load_groupcat(args.root, 99, {"Group": GROUP_FIELDS, "Subhalo": SUBHALO_FIELDS})
 
+    print("checking which halos are complete on disk", flush=True)
+    avail = all_halos(cat, hd, args.root)
     if args.population == "2d":
-        avail = np.genfromtxt(AVAIL, delimiter=",", names=True, dtype=None, encoding=None)
-        avail = {k: np.asarray(avail[k]) for k in avail.dtype.names}
-        print("halo level (2D maps)", flush=True)
+        avail = {k: v[avail["in_2d"] == 1] for k, v in avail.items()}
+        print(f"halo level ({len(avail['gid']):,} halos with 2D maps)", flush=True)
         halo = map_quantities(avail["gid"])
     else:
-        print("halo level (all halos with a galaxy)", flush=True)
-        avail = all_halos(cat, hd)
+        print(f"halo level ({len(avail['gid']):,} halos with a galaxy)", flush=True)
         halo = {}
     halo.update(catalog_quantities(cat, avail["gid"], avail["central_subhalo"], h, a))
 
