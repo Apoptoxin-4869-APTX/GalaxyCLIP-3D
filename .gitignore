@@ -8,7 +8,8 @@ outputs/
 *.npz
 *.npy
 
-# Caches, logs, editor state
+# Caches, logs, editor state, shared pip packages (pip install --target pylibs)
+pylibs/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/

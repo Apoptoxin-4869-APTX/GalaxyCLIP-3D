@@ -1,0 +1,32 @@
+#!/bin/bash
+# Extract the shards of a point-cloud build as a SLURM job array; array task i builds shards i, i + N, i + 2N, ...
+# where N is the number of array tasks.
+#
+#   PYTHONPATH=pylibs python3 -s tools/build_selection.py --config configs/pc_v1.json     # once; prints the shard count
+#   env -u SLURM_JOB_ID sbatch --array=0-41%16 slurm/build_pointclouds.submit           # 42 tasks, 16 at a time
+#   PYTHONPATH=pylibs python3 -s tools/finalize_pointclouds.py --out "$OUT"               # once every shard exists
+#
+# Finished shards are skipped and shards are written atomically, so resubmitting the same array is safe.
+# Cluster rules this keeps:
+#   * --account=cai_ivs is mandatory; submit with `env -u SLURM_JOB_ID sbatch ...`
+#   * at most 80 queued jobs per user on cpu (array tasks count), hence several shards per task
+#   * /usr/bin/python3 (3.12) with numpy and h5py from the repo's pylibs/ works on both cpu nodes (hilo, honolulu);
+#     venvs on /raid/persistent_scratch exist on one node only
+#   * each shard holds at most one of the largest galaxies (shards are dealt by particle count)
+#SBATCH --job-name=pc-build
+#SBATCH --partition=cpu
+#SBATCH --account=cai_ivs
+#SBATCH --time=04:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=24G
+#SBATCH --output=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/pc_build_%A_%a.out
+
+set -euo pipefail
+PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
+OUT="${OUT:-/cluster/projects/ska/illustris/tng50-1.pointclouds/v1}"
+cd "${PROJECT_DIR}"
+echo "[pc-build] $(date) on $(hostname), job ${SLURM_ARRAY_JOB_ID:-none}_${SLURM_ARRAY_TASK_ID:-none}, out ${OUT}"
+PYTHONPATH="${PROJECT_DIR}/pylibs" /usr/bin/python3 -s -u tools/build_pointclouds.py --out "${OUT}" \
+    --task "${SLURM_ARRAY_TASK_ID}" --tasks "${SLURM_ARRAY_TASK_COUNT}"

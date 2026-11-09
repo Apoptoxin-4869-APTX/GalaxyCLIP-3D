@@ -119,6 +119,24 @@ python tools/audit_snapshot.py --csv data/snap099_halo_availability.csv   # ~2 m
 python tools/check_2d_selection.py 100 500 1031 2913 765                  # ~1.5 min
 ```
 
+## Point-cloud dataset v1 (our own, 2026-11-09)
+
+`/cluster/projects/ska/illustris/tng50-1.pointclouds/v1/`, built from the complete snapshot copy: 5,254 galaxies
+(centrals and satellites) with four modalities, namely stars, dark matter, gas and HI, 2,048 points each, drawn
+fresh every epoch by `galaxyclip3d/dataset.py`. At the default sphere of 5 stellar half-mass radii, 5,071 galaxies
+qualify (train 4,052 / val 520 / test 499, split by halo). Fields, units, masks and caveats: **`DATASET.md`**.
+
+| Step | Code |
+|---|---|
+| select galaxies, split by halo | `tools/build_selection.py` (`galaxyclip3d/pointclouds/select.py`) |
+| extract particles into shards | `slurm/build_pointclouds.submit` → `tools/build_pointclouds.py` (`extract.py`, `store.py`) |
+| index, feature statistics, frozen val/test clouds | `tools/finalize_pointclouds.py` |
+| quality checks and example clouds | `tools/check_pointclouds.py` |
+| draw clouds, PyTorch loader | `galaxyclip3d/pointclouds/sampling.py`, `galaxyclip3d/dataset.py` |
+
+The build needs only numpy and h5py (`pylibs/`, see `DATASET.md`); the loader needs torch.
+`tests/test_pointclouds.py` runs the whole pipeline on a synthetic snapshot.
+
 ## Code shared with GalaxyCLIP-2D
 
 Copied from GalaxyCLIP-2D commit `8b0a377` (modality-agnostic, unchanged unless noted):
