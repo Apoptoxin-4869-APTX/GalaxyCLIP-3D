@@ -1,0 +1,27 @@
+{
+  "root": "/cluster/projects/ska/illustris/tng50-1.new",
+  "out": "/cluster/projects/ska/illustris/tng50-1.pointclouds/v3",
+  "snap": 99,
+  "budget": 2048,
+  "min_particles": 4096,
+  "min_rhalf_star_kpc": 0.576,
+  "radii": [
+    2.0,
+    3.0,
+    5.0,
+    7.5,
+    10.0
+  ],
+  "extract_radius": 10.0,
+  "train_radius": 5.0,
+  "hi_min_eff": 512.0,
+  "cap": 262144,
+  "split": [
+    0.8,
+    0.1,
+    0.1
+  ],
+  "seed": 4869,
+  "shard_size": 64,
+  "chunk_rows": 8000000
+}

@@ -1,6 +1,6 @@
 {
   "root": "/cluster/projects/ska/illustris/tng50-1.new",
-  "out": "/cluster/projects/ska/illustris/tng50-1.pointclouds/v1",
+  "out": "/cluster/projects/ska/illustris/tng50-1.pointclouds/v2",
   "snap": 99,
   "budget": 2048,
   "min_particles": 4096,
@@ -15,7 +15,7 @@
   "extract_radius": 10.0,
   "train_radius": 5.0,
   "hi_min_eff": 512.0,
-  "cap": 131072,
+  "cap": 262144,
   "split": [
     0.8,
     0.1,

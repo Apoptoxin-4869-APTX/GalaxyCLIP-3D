@@ -1,6 +1,6 @@
 """Pictures of galaxies' four point clouds (stars, dark matter, gas, HI) in 3D, each point coloured by a property.
 
-    python tools/plot_clouds.py --out /cluster/projects/ska/illustris/tng50-1.pointclouds/v1 \
+    python tools/plot_clouds.py --out /cluster/projects/ska/illustris/tng50-1.pointclouds/v3 [--snap 99] \
         --save outputs/pointcloud_examples [--subhalo 0 143885] [--n 6]
 
 Clouds are drawn the way the training loader draws them (sphere of the build's training radius, `budget` points each,
@@ -15,7 +15,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import h5py
 import matplotlib
 
 matplotlib.use("Agg")
@@ -25,6 +24,7 @@ from matplotlib.colors import LinearSegmentedColormap                       # no
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from galaxyclip3d.pointclouds.config import Config                          # noqa: E402
+from galaxyclip3d.pointclouds.layout import read_table, shard_path, snapshot_dir  # noqa: E402
 from galaxyclip3d.pointclouds.sampling import FEATURES, draw                # noqa: E402
 from galaxyclip3d.pointclouds.store import Shard                            # noqa: E402
 
@@ -70,7 +70,7 @@ def colour_values(mod: str, cloud: np.ndarray, vmax: float) -> np.ndarray:
 
 
 def figure(index: dict, j: int, out: Path, cfg: Config, mask: np.ndarray, path: Path) -> None:
-    sh = Shard(out / "shards" / f"shard_{int(index['shard'][j]):04d}.h5")
+    sh = Shard(shard_path(out, int(index["snapshot"][j]), int(index["shard"][j])))
     row = int(index["row"][j])
     parts = {t: sh.particles(row, t) for t in ("stars", "dm", "gas")}
     radius = cfg.train_radius * float(index["rhalf_star_kpc"][j])
@@ -139,14 +139,14 @@ def pick(index: dict, usable: np.ndarray, mask: np.ndarray, n: int) -> list[int]
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", type=Path, required=True, help="the dataset folder")
+    ap.add_argument("--snap", type=int, default=99, help="snapshot of the dataset to draw from")
     ap.add_argument("--save", type=Path, required=True, help="folder for the pictures")
     ap.add_argument("--subhalo", type=int, nargs="*")
     ap.add_argument("--n", type=int, default=6)
     ap.add_argument("--combine", type=Path, help="also stack all pictures into this one PNG")
     args = ap.parse_args()
-    cfg = Config.load(args.out / "config.json")
-    with h5py.File(args.out / "index.h5", "r") as f:
-        index = {k: v[()] for k, v in f["galaxies"].items()}
+    cfg = Config.load(snapshot_dir(args.out, args.snap) / "config.json")
+    index = read_table(snapshot_dir(args.out, args.snap) / "index.h5")
     k = f"r{cfg.train_radius:g}"
     usable = (index[f"n_stars_{k}"] >= cfg.min_particles) & (index[f"n_dm_{k}"] >= cfg.min_particles)
     ones = np.ones(len(usable), dtype=bool)

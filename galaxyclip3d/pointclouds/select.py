@@ -1,4 +1,5 @@
-"""Choose the galaxies (Subfind subhalos) of the dataset and split them into train/val/test by halo.
+"""Choose the galaxies (Subfind subhalos) of one snapshot. Their train/val/test split is decided in lineage.py, so
+that a galaxy's versions at different snapshots share it; assign_splits below deals new split units to splits.
 
 Filters (from the 3D filter suggestions): SubhaloFlag = 1, at least cfg.min_particles bound star and dark-matter
 particles, stellar half-mass radius at least cfg.min_rhalf_star_kpc. Gas is not required: galaxies with fewer than
@@ -25,14 +26,15 @@ def halos_with_2d_maps(snap: int, path: Path = BLOCKS_2D) -> np.ndarray:
     return np.array(sorted({g for s, g in json.load(open(path))["blocks"] if s == snap}), dtype=np.int64)
 
 
-def assign_splits(group: np.ndarray, log_mstar: np.ndarray, fractions, seed: int, strata: int = 6) -> np.ndarray:
-    """Split code per galaxy (0 train, 1 val, 2 test). Whole halos go to one split; within each stellar-mass stratum
-    of halos (by their most massive selected galaxy) halos are dealt to the split furthest below its share."""
+def assign_splits(group: np.ndarray, log_mstar: np.ndarray, fractions, seed, strata: int = 6) -> np.ndarray:
+    """Split code per galaxy (0 train, 1 val, 2 test). Whole units (`group`: halos, or any unit label) go to one
+    split; within each stellar-mass stratum of units (by their most massive galaxy) units are dealt to the split
+    furthest below its share."""
     groups, inverse = np.unique(group, return_inverse=True)
     size = np.bincount(inverse)
     top = np.full(len(groups), -np.inf)
     np.maximum.at(top, inverse, log_mstar)
-    edges = np.quantile(top, np.linspace(0, 1, strata + 1)[1:-1])
+    edges = np.quantile(top, np.linspace(0, 1, strata + 1)[1:-1]) if len(top) else np.zeros(strata - 1)
     stratum = np.digitize(top, edges)
     rng = np.random.default_rng(seed)
     code = np.zeros(len(groups), dtype=np.int8)
@@ -48,7 +50,9 @@ def assign_splits(group: np.ndarray, log_mstar: np.ndarray, fractions, seed: int
 
 
 def select(cfg: Config, snap: Snapshot) -> dict[str, np.ndarray]:
-    """One entry per selected galaxy, in subhalo order."""
+    """One entry per selected galaxy, in subhalo order (without the split, which lineage.py adds)."""
+    if snap.snap != cfg.snap:
+        raise ValueError(f"snapshot {snap.snap} opened for a build of snapshot {cfg.snap}")
     cat = snap.catalog(["GroupFirstSub"], SUBHALO_FIELDS)
     u = snap.units
     n = cat["SubhaloLenType"].astype(np.int64)
@@ -59,11 +63,12 @@ def select(cfg: Config, snap: Snapshot) -> dict[str, np.ndarray]:
     group = cat["SubhaloGrNr"][ids].astype(np.int64)
     mstar = u.msun(cat["SubhaloMassInRadType"][ids, 4])
     return dict(
+        snapshot=np.full(len(ids), snap.snap, dtype=np.int16),
+        redshift=np.full(len(ids), snap.redshift),
         subhalo=ids.astype(np.int64),
         group=group,
         central=(cat["GroupFirstSub"][group] == ids),
         halo_has_2d=np.isin(group, halos_with_2d_maps(cfg.snap)),
-        split=assign_splits(group, np.log10(np.maximum(mstar, 1.0)), cfg.split, cfg.seed),
         centre=cat["SubhaloPos"][ids].astype(np.float64),          # code units, ckpc/h
         bulk_velocity=cat["SubhaloVel"][ids].astype(np.float64),   # km/s
         vmax=cat["SubhaloVmax"][ids].astype(np.float64),           # km/s

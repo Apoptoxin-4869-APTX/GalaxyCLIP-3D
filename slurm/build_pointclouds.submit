@@ -1,10 +1,11 @@
 #!/bin/bash
-# Extract the shards of a point-cloud build as a SLURM job array; array task i builds shards i, i + N, i + 2N, ...
-# where N is the number of array tasks.
+# Extract the shards of one snapshot of a point-cloud dataset as a SLURM job array; array task i builds shards
+# i, i + N, i + 2N, ... where N is the number of array tasks. Adding a snapshot S to the dataset:
 #
-#   PYTHONPATH=pylibs python3 -s tools/build_selection.py --config configs/pc_v1.json     # once; prints the shard count
-#   env -u SLURM_JOB_ID sbatch --array=0-41%16 slurm/build_pointclouds.submit           # 42 tasks, 16 at a time
-#   PYTHONPATH=pylibs python3 -s tools/finalize_pointclouds.py --out "$OUT"               # once every shard exists
+#   PYTHONPATH=pylibs python3 -s tools/build_selection.py --config configs/pc_v3.json --snap S   # prints the shard count
+#   SNAP=S env -u SLURM_JOB_ID sbatch --export=ALL --array=0-41%16 slurm/build_pointclouds.submit  # 42 tasks, 16 at once
+#   PYTHONPATH=pylibs python3 -s tools/finalize_pointclouds.py --out "$OUT" --snap S           # once every shard exists
+#   python tools/check_pointclouds.py --out "$OUT" --snap S --pdf "$OUT/snap_SSS/qa_clouds.pdf"
 #
 # Finished shards are skipped and shards are written atomically, so resubmitting the same array is safe.
 # Cluster rules this keeps:
@@ -25,8 +26,9 @@
 
 set -euo pipefail
 PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
-OUT="${OUT:-/cluster/projects/ska/illustris/tng50-1.pointclouds/v1}"
+OUT="${OUT:-/cluster/projects/ska/illustris/tng50-1.pointclouds/v3}"
+SNAP="${SNAP:?set SNAP to the snapshot to build, e.g. SNAP=91 ... sbatch --export=ALL ...}"
 cd "${PROJECT_DIR}"
-echo "[pc-build] $(date) on $(hostname), job ${SLURM_ARRAY_JOB_ID:-none}_${SLURM_ARRAY_TASK_ID:-none}, out ${OUT}"
-PYTHONPATH="${PROJECT_DIR}/pylibs" /usr/bin/python3 -s -u tools/build_pointclouds.py --out "${OUT}" \
+echo "[pc-build] $(date) on $(hostname), job ${SLURM_ARRAY_JOB_ID:-none}_${SLURM_ARRAY_TASK_ID:-none}, out ${OUT}, snap ${SNAP}"
+PYTHONPATH="${PROJECT_DIR}/pylibs" /usr/bin/python3 -s -u tools/build_pointclouds.py --out "${OUT}" --snap "${SNAP}" \
     --task "${SLURM_ARRAY_TASK_ID}" --tasks "${SLURM_ARRAY_TASK_COUNT}"

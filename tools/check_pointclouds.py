@@ -1,10 +1,13 @@
-"""Quality checks of a point-cloud build, and a PDF of example clouds to look at before training.
+"""Quality checks of one snapshot of a point-cloud dataset, and a PDF of example clouds to look at before training.
 
-    python tools/check_pointclouds.py --out DIR [--file DIR/pilot.h5] [--pdf PATH] [--galaxies 12]
+    python tools/check_pointclouds.py --out DIR --snap 99 [--file DIR/snap_099/pilot.h5] [--pdf PATH] [--galaxies 12]
 
-Checks every shard (or one --file): stored counts against the selection, no NaN or infinite values, plausible
-value ranges, whole halos in one split, gas and HI draws sharing no coordinates. The PDF shows, for galaxies across
-stellar mass, one drawn cloud per modality projected on x-y; only the PDF needs matplotlib.
+Checks every shard of the snapshot (or one --file): it says it holds this snapshot, stored counts against the
+selection, no NaN or infinite values, plausible value ranges, gas and HI draws sharing no coordinates, and the splits:
+every split unit (the z = 0 halo a galaxy ends in) in one split, the same one OUT/splits.h5 records for all snapshots.
+Halos of this snapshot whose galaxies end in different z = 0 halos, and so may sit in different splits, are counted.
+The PDF shows, for galaxies across stellar mass, one drawn cloud per modality projected on x-y; only it needs
+matplotlib.
 """
 from __future__ import annotations
 
@@ -12,12 +15,13 @@ import argparse
 import sys
 from pathlib import Path
 
-import h5py
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from galaxyclip3d.pointclouds.config import Config                          # noqa: E402
 from galaxyclip3d.pointclouds.extract import FIELDS                         # noqa: E402
+from galaxyclip3d.pointclouds.layout import read_table, snapshot_dir         # noqa: E402
+from galaxyclip3d.pointclouds.lineage import load_splits, unit_keys         # noqa: E402
 from galaxyclip3d.pointclouds.sampling import MODALITIES, draw              # noqa: E402
 from galaxyclip3d.pointclouds.store import Shard                            # noqa: E402
 
@@ -29,6 +33,8 @@ SURFACE, INK, INK2, BLUE = "#fcfcfb", "#0b0b0b", "#52514e", "#2a78d6"
 def check_shard(sh: Shard, cfg: Config, problems: list[str]) -> dict:
     g = sh.galaxies()
     name = sh.path.name
+    if int(sh.file.attrs.get("snapshot", -1)) != cfg.snap or not (g["snapshot"] == cfg.snap).all():
+        problems.append(f"{name}: does not say it holds snapshot {cfg.snap}")
     for typ, fields in FIELDS.items():
         off = sh.file[typ]["offsets"][()]
         stored = np.diff(off)
@@ -103,7 +109,7 @@ def pdf(files: list[Path], cfg: Config, n: int, path: Path) -> None:
             for ax_row in axes[len(pick[k:k + 3]):]:
                 for ax in ax_row:
                     ax.axis("off")
-            fig.suptitle(f"Drawn clouds ({cfg.budget:,} points each), x-y projection, sphere of "
+            fig.suptitle(f"Snapshot {cfg.snap}: drawn clouds ({cfg.budget:,} points each), x-y projection, sphere of "
                          f"{cfg.train_radius:g} stellar half-mass radii", x=0.01, ha="left", fontsize=11, color=INK)
             fig.tight_layout(rect=(0, 0, 1, 0.96))
             pp.savefig(fig, facecolor=SURFACE)
@@ -113,19 +119,22 @@ def pdf(files: list[Path], cfg: Config, n: int, path: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--file", type=Path, help="check this one shard-format file instead of OUT/shards")
+    ap.add_argument("--out", type=Path, required=True, help="dataset folder")
+    ap.add_argument("--snap", type=int, required=True)
+    ap.add_argument("--file", type=Path, help="check this one shard-format file instead of the snapshot's shards")
     ap.add_argument("--pdf", type=Path)
     ap.add_argument("--galaxies", type=int, default=12)
     args = ap.parse_args()
-    cfg = Config.load(args.out / "config.json")
-    files = [args.file] if args.file else sorted((args.out / "shards").glob("shard_*.h5"))
+    sdir = snapshot_dir(args.out, args.snap)
+    cfg = Config.load(sdir / "config.json")
+    files = [args.file] if args.file else sorted((sdir / "shards").glob("shard_*.h5"))
     problems: list[str] = []
     if not args.file:
-        with h5py.File(args.out / "selection.h5", "r") as f:
-            n_shards = int(f["galaxies/shard"][()].max()) + 1
+        n_shards = int(read_table(sdir / "selection.h5")["shard"].max()) + 1
         if len(files) != n_shards:
             problems.append(f"{n_shards - len(files)} of {n_shards} shards missing")
+    registry, _ = load_splits(args.out)
+    units_split: dict[int, set] = {}
     groups_split: dict[int, set] = {}
     shared = 0
     n_gal = 0
@@ -133,18 +142,24 @@ def main() -> None:
         sh = Shard(f)
         g = check_shard(sh, cfg, problems)
         n_gal += len(g["subhalo"])
-        for grp, sp in zip(g["group"], g["split"]):
+        for grp, key, sp in zip(g["group"], unit_keys(g["unit_snap"], g["unit_group"]), g["split"]):
             groups_split.setdefault(int(grp), set()).add(int(sp))
+            units_split.setdefault(int(key), set()).add(int(sp))
+            if int(key) not in registry or registry[int(key)][0] != int(sp):
+                problems.append(f"{f.name}: a galaxy's split differs from OUT/splits.h5 for its split unit")
         for r in range(0, len(g["subhalo"]), max(1, len(g["subhalo"]) // 4)):
             radius = cfg.train_radius * g["rhalf_star_kpc"][r]
             shared += shared_coordinates(sh, r, radius, g["vmax"][r], cfg.budget)
+    split_units = sum(len(v) > 1 for v in units_split.values())
+    if split_units:
+        problems.append(f"{split_units} split units have galaxies in more than one split")
     split_halos = sum(len(v) > 1 for v in groups_split.values())
-    if split_halos:
-        problems.append(f"{split_halos} halos have galaxies in more than one split")
     if shared:
         problems.append(f"{shared} HI points share exact coordinates with gas points")
-    print(f"checked {len(files)} file(s), {n_gal:,} galaxies: " + ("no problems" if not problems else
-                                                                    f"{len(problems)} problems"))
+    print(f"snapshot {args.snap}: checked {len(files)} file(s), {n_gal:,} galaxies: " +
+          ("no problems" if not problems else f"{len(problems)} problems"))
+    print(f"  halos of this snapshot with galaxies in more than one split (their galaxies end in different z = 0 "
+          f"halos): {split_halos}")
     for p in problems[:50]:
         print("  " + p)
     if args.pdf:

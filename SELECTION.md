@@ -1,20 +1,24 @@
 # How the point-cloud dataset selects its galaxies, particles and points
 
-This describes every selection step of the GalaxyCLIP-3D point-cloud dataset v1, with the counts after each step,
-the reason for it, the setting that controls it and the code that does it. Field descriptions and loading are in
-`DATASET.md`.
+This describes every selection step of the GalaxyCLIP-3D point-cloud dataset v3, with the counts after each step,
+the reason for it, the setting that controls it and the code that does it. Field descriptions, loading and adding a
+snapshot are in `DATASET.md`.
 
-- **Source:** TNG50-1 snapshot 99 (z = 0), complete copy at `/cluster/projects/ska/illustris/tng50-1.new`, called
-  `tng50-1.snap099` when v1 was built.
-- **Dataset:** `/cluster/projects/ska/illustris/tng50-1.pointclouds/v1`.
-- **Settings:** `configs/pc_v1.json`, copied to `config.json` in the dataset folder.
+- **Source:** TNG50-1 snapshot 99 (z = 0), complete copy at `/cluster/projects/ska/illustris/tng50-1.new`. Snapshots
+  added later go through the same steps; the counts below are snapshot 99's.
+- **Dataset:** `/cluster/projects/ska/illustris/tng50-1.pointclouds/v3` (snapshot 99 in `snap_099/`).
+- **Settings:** `configs/pc_v3.json`; the dataset's `config.json` holds the settings shared by all snapshots and
+  `snap_NNN/config.json` each snapshot's full settings.
+- **Versions:** v3 (2026-11-09) is v2 rebuilt with code that records the snapshot and can add snapshots; snapshot 99's
+  galaxies, splits and stored particles are identical to v2's (checked, then v2 was deleted). v2 replaced v1 the same
+  day; only the storage cap changed, from 131,072 to 262,144 particles per type and galaxy (step 2.5).
 
 Selection happens at three levels:
 
 | Level | From | To | Code |
 |---|---|---|---|
 | Galaxies | 5,688,113 Subfind subhalos | 5,254 selected; 5,071 usable at the default sphere | `pointclouds/select.py`, `dataset.py` |
-| Particles | 20.1 billion gas, dark-matter and star particles | 0.81 billion stored (34 GB) | `pointclouds/extract.py` |
+| Particles | 20.1 billion gas, dark-matter and star particles | 1.12 billion stored (47 GB) | `pointclouds/extract.py` |
 | Points | a galaxy's stored particles | 4 clouds × 2,048 points per draw | `pointclouds/sampling.py` |
 
 ## 1. Galaxies
@@ -48,10 +52,19 @@ belong to 3,218 halos. 4,721 of them sit in a halo that has 2D maps, 2,678 of th
 
 ### 1.3 Train, validation and test split
 
-Whole FoF halos go to one split, so a satellite is never in another split than its central and the galaxies around
-it (`assign_splits()`). Halos are grouped into 6 strata by the stellar mass of their most massive selected galaxy. Within each stratum, in a
-random order (seed 4869, `seed`), each halo goes to the split furthest below its target share of 80/10/10 of the
-galaxies (`split`). Result: train 4,198, validation 536, test 520 galaxies.
+The split is given to **split units** that every snapshot shares, so that a galaxy and its progenitors or descendants
+at other snapshots, which look alike, never sit in different splits (`galaxyclip3d/pointclouds/lineage.py`). A
+galaxy's unit is the FoF halo at snapshot 99 (z = 0) in which its SubLink main descendant branch ends, fetched from
+the TNG API (`sublink/simple.json`) by `tools/build_selection.py`; without a branch reaching snapshot 99, its own halo
+at its own snapshot.
+
+At snapshot 99 every galaxy is its own descendant, so the units are simply the FoF halos, and a satellite is never in
+another split than its central and the galaxies around it. Units new to the dataset are dealt by `assign_splits()`:
+they are grouped into 6 strata by the stellar mass of their most massive selected galaxy, and within each stratum, in
+a random order (seed 4869, `seed`), each unit goes to the split furthest below its target share of 80/10/10 of the
+galaxies (`split`). Result at snapshot 99, identical to v2: train 4,198, validation 536, test 520 galaxies in 3,218
+units. Every unit's split is kept in `splits.h5`; a snapshot added later reuses the recorded splits and deals only
+its new units, with seed (4869, snapshot). All 5,254 branches of snapshot 99 end in the galaxy itself, as they should.
 
 ### 1.4 Usable galaxies at the chosen sphere
 
@@ -92,13 +105,13 @@ A masked modality is returned as an all-zero cloud with its `mask` entry false, 
    and 10 radii are recorded (`radii`), plus the HI effective cell count at each.
 4. **Wind cells.** PartType4 entries with `GFM_StellarFormationTime ≤ 0` are wind-phase gas, not stars, and are
    removed. They are a median 0.9% of the star-particle mass in halos with 2D maps, at most 6%.
-5. **Cap.** If more than 131,072 particles of one type lie in the sphere (`cap`), a random subset is kept. Each
-   particle is kept with probability π = min(1, c·q), with c chosen so the expected number kept is 131,072. Here q is
+5. **Cap.** If more than 262,144 particles of one type lie in the sphere (`cap`), a random subset is kept. Each
+   particle is kept with probability π = min(1, c·q), with c chosen so the expected number kept is 262,144. Here q is
    the particle's mass for stars, the same for every dark-matter particle, and half its mass plus half its HI mass for gas. The stored weight
    `wcorr` = 1/π makes mass- and HI-weighted draws unbiased again, so each original particle's chance of being drawn
    stays proportional to its mass (or HI mass). The random seed is (4869, subhalo, type), so rebuilds are identical.
-   Capped galaxies: 1,040 for stars, 1,346 for dark matter, 725 for gas. Median stored per galaxy: 21,925 star
-   particles, 51,930 dark-matter particles, 19,708 gas cells.
+   Capped galaxies: 697 for stars, 762 for dark matter, 321 for gas (with v1's cap of 131,072: 1,040, 1,346 and
+   725). Median stored per galaxy: 21,925 star particles, 51,930 dark-matter particles, 19,708 gas cells.
 6. **Fields.** Only what the modalities need is kept, in float32:
 
 | Type | Stored field | From the snapshot |
@@ -130,9 +143,9 @@ available in the snapshot if a future modality needs them.
 | Whole snapshot | 8.74 billion (1.85 TB) | 10.08 billion (0.64 TB) | 1.29 billion, incl. wind (0.26 TB) |
 | Bound to the 5,254 galaxies | 1.75 billion (20%) | 3.91 billion (39%) | 1.25 billion (97%) |
 | Inside 10 radii (stars: wind removed) | 0.48 billion (5.5%) | 1.30 billion (12.9%) | 1.20 billion (93%) |
-| Stored after the cap | 0.213 billion (2.4%) | 0.351 billion (3.5%) | 0.249 billion (19%) |
-| Bytes per particle, snapshot → stored | 212 → 62 | 64 → 28 | 204 → 45 |
-| Stored size | 13.2 GB | 9.9 GB | 11.1 GB |
+| Stored after the cap | 0.278 billion (3.2%) | 0.481 billion (4.8%) | 0.359 billion (28%) |
+| Bytes per particle, snapshot → stored | 212 → 62 | 64 → 28 | 204 → 44 |
+| Stored size | 17.1 GB | 13.6 GB | 15.9 GB |
 
 Tracers add 0.16 TB to the snapshot's 2.93 TB and are not used.
 
@@ -158,7 +171,8 @@ Tracers add 0.16 TB to the snapshot's 2.93 TB and are not used.
    the galaxy's `SubhaloVmax`. Age, metallicity, density, temperature and field strength are standardized with the
    mean and spread of 1,000 training galaxies (`feature_stats.json`).
 6. **Rotation.** Training clouds get one random rotation per galaxy, the same for all four modalities. Validation and test clouds are
-   drawn once, unrotated (`frozen/`, seed (4869, subhalo, 1); 520 and 499 galaxies at 5 radii).
+   drawn once, unrotated (each snapshot's `frozen/`, seed (4869, subhalo, 1); 520 and 499 galaxies at 5 radii for
+   snapshot 99).
    *Caveat:* because a galaxy's four clouds share an orientation, a contrastive model can match them by orientation
    instead of physics. Independent rotations per modality are not implemented yet.
 
@@ -166,17 +180,18 @@ Each training draw is new, so over the epochs a large galaxy is seen through man
 
 ## 4. Settings and what changing them needs
 
-| Setting | v1 value | Controls | After a change, rerun |
+| Setting | v3 value | Controls | After a change, rerun |
 |---|---|---|---|
 | `min_particles` | 4,096 | galaxy filter (steps 2–3), usability inside the sphere, gas mask | everything (selection changes) |
 | `min_rhalf_star_kpc` | 0.576 | size filter (step 4) | everything |
-| `split`, `seed` | 80/10/10, 4869 | split by halo; cap and frozen-set seeds | everything |
+| `split`, `seed` | 80/10/10, 4869 | split of new units; cap and frozen-set seeds | everything, in a new dataset |
 | `extract_radius`, `radii` | 10; 2, 3, 5, 7.5, 10 | stored sphere and recorded counts | extraction and finalize |
-| `cap` | 131,072 | particles stored per type and galaxy | extraction and finalize |
+| `cap` | 262,144 | particles stored per type and galaxy | extraction and finalize |
 | `train_radius` | 5 | default sphere for drawing | finalize (frozen sets) only |
 | `budget` | 2,048 | points per cloud | finalize (frozen sets) only |
 | `hi_min_eff` | 512 | HI mask | nothing to rebuild; the loader reads it |
 
-"Everything" is `tools/build_selection.py`, the SLURM extraction job and `tools/finalize_pointclouds.py` (see the
-rebuilding section of `DATASET.md`). A different value needs a new output folder: the selection script refuses to
-mix settings in one folder.
+"Everything" is `tools/build_selection.py`, the SLURM extraction job and `tools/finalize_pointclouds.py` for every
+snapshot (see `DATASET.md`). A different value needs a new dataset folder: the selection script refuses to mix
+settings in one dataset, so all its snapshots are built the same way. Only `root` (where the raw snapshot is), `snap`
+and `chunk_rows` may differ between snapshots.

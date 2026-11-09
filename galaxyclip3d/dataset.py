@@ -1,11 +1,14 @@
-"""PyTorch access to the point-cloud dataset built by tools/build_pointclouds.py and tools/finalize_pointclouds.py.
+"""PyTorch access to the point-cloud dataset built by tools/build_selection.py, build_pointclouds.py and
+finalize_pointclouds.py.
 
-Each item is one galaxy with four clouds of `budget` points (stars, dm, gas, hi; see pointclouds/sampling.py), a mask
-of which modalities are present, and the galaxy's identity (snapshot, halo, subhalo) for pairing with the 2D maps.
-Training clouds are drawn fresh every time; validation and test clouds come from the frozen file, so evaluation is the
-same every run.
+Each item is one galaxy at one snapshot with four clouds of `budget` points (stars, dm, gas, hi; see
+pointclouds/sampling.py), a mask of which modalities are present, and the galaxy's identity (snapshot, redshift, halo,
+subhalo, its z = 0 descendant) for pairing with the 2D maps or across snapshots. Training clouds are drawn fresh every
+time; validation and test clouds come from each snapshot's frozen file, so evaluation is the same every run. Splits are
+shared across snapshots (pointclouds/lineage.py): a galaxy's versions at different snapshots are always in one split.
 
-    ds = PointCloudDataset("/cluster/projects/ska/illustris/tng50-1.pointclouds/v1", "train")
+    ds = PointCloudDataset("/cluster/projects/ska/illustris/tng50-1.pointclouds/v3", "train")             # all snapshots
+    ds = PointCloudDataset("/cluster/projects/ska/illustris/tng50-1.pointclouds/v3", "val", snapshots=[99])
     loader = DataLoader(ds, batch_size=64, sampler=MassBalancedSampler(ds), num_workers=8)
 """
 from __future__ import annotations
@@ -18,6 +21,7 @@ import numpy as np
 import torch
 
 from .pointclouds.config import Config
+from .pointclouds.layout import frozen_path, read_table, shard_path
 from .pointclouds.sampling import MODALITIES, draw, standardize
 from .pointclouds.select import SPLITS
 from .pointclouds.store import Shard
@@ -34,7 +38,7 @@ def galaxy_masks(index: dict[str, np.ndarray], cfg: Config, radius: float) -> tu
 
 
 class PointCloudDataset(torch.utils.data.Dataset):
-    def __init__(self, root: str | Path, split: str = "train", radius: float | None = None,
+    def __init__(self, root: str | Path, split: str = "train", radius: float | None = None, snapshots=None,
                  gas_required: bool = False, frozen: bool | None = None, rotate: bool | None = None,
                  standardized: bool = True):
         self.root = Path(root)
@@ -42,39 +46,50 @@ class PointCloudDataset(torch.utils.data.Dataset):
         self.radius = self.cfg.train_radius if radius is None else radius
         if self.radius not in self.cfg.radii:
             raise ValueError(f"radius must be one of {self.cfg.radii}")
-        with h5py.File(self.root / "index.h5", "r") as f:
-            self.index = {k: v[()] for k, v in f["galaxies"].items()}
+        self.index = read_table(self.root / "index.h5")
+        self.snapshots = sorted({int(s) for s in self.index["snapshot"]}) if snapshots is None else \
+            sorted(int(s) for s in snapshots)
+        absent = set(self.snapshots) - {int(s) for s in self.index["snapshot"]}
+        if absent:
+            raise ValueError(f"snapshots {sorted(absent)} are not in {self.root}")
         usable, self.mask = galaxy_masks(self.index, self.cfg, self.radius)
-        keep = usable & (self.index["split"] == SPLITS.index(split))
+        keep = usable & (self.index["split"] == SPLITS.index(split)) & np.isin(self.index["snapshot"], self.snapshots)
         if gas_required:
             keep &= self.mask[:, 2]
         self.rows = np.flatnonzero(keep)
         self.frozen = split != "train" if frozen is None else frozen
         self.rotate = not self.frozen if rotate is None else rotate
         self.stats = json.loads((self.root / "feature_stats.json").read_text()) if standardized else None
-        self._shards: dict[int, Shard] = {}
-        self._frozen = None
+        self._shards: dict[tuple[int, int], Shard] = {}
+        self._frozen: dict[int, h5py.File] = {}
         if self.frozen:
-            path = self.root / "frozen" / f"{split}_r{self.radius:g}.h5"
-            with h5py.File(path, "r") as f:
-                pos = {s: i for i, s in enumerate(f["subhalo"][()])}
-                self._frozen_row = np.array([pos[s] for s in self.index["subhalo"][self.rows]])
-            self._frozen_path = path
+            self._frozen_paths, where = {}, {}
+            for snap in self.snapshots:
+                path = frozen_path(self.root, snap, split, self.radius)
+                if not path.exists():
+                    raise FileNotFoundError(f"{path} missing: run tools/finalize_pointclouds.py --snap {snap} "
+                                            f"--radius {self.radius:g}")
+                self._frozen_paths[snap] = path
+                with h5py.File(path, "r") as f:
+                    where.update({(snap, int(s)): i for i, s in enumerate(f["subhalo"][()])})
+            self._frozen_row = np.array([where[(int(self.index["snapshot"][j]), int(self.index["subhalo"][j]))]
+                                         for j in self.rows], dtype=np.int64)
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def clouds(self, i: int) -> dict[str, np.ndarray]:
         j = self.rows[i]
+        snap = int(self.index["snapshot"][j])
         if self.frozen:
-            if self._frozen is None:                        # opened lazily, inside each worker
-                self._frozen = h5py.File(self._frozen_path, "r")
-            return {m: self._frozen[m][self._frozen_row[i]] for m in MODALITIES}
-        s = int(self.index["shard"][j])
-        if s not in self._shards:
-            self._shards[s] = Shard(self.root / "shards" / f"shard_{s:04d}.h5")
+            if snap not in self._frozen:                    # opened lazily, inside each worker
+                self._frozen[snap] = h5py.File(self._frozen_paths[snap], "r")
+            return {m: self._frozen[snap][m][self._frozen_row[i]] for m in MODALITIES}
+        key = (snap, int(self.index["shard"][j]))
+        if key not in self._shards:
+            self._shards[key] = Shard(shard_path(self.root, *key))
         row = int(self.index["row"][j])
-        parts = {name: self._shards[s].particles(row, name) for name in ("stars", "dm", "gas")}
+        parts = {name: self._shards[key].particles(row, name) for name in ("stars", "dm", "gas")}
         radius_kpc = self.radius * float(self.index["rhalf_star_kpc"][j])
         return draw(parts, radius_kpc, float(self.index["vmax"][j]), self.cfg.budget, np.random.default_rng(),
                     rotate=self.rotate)
@@ -86,8 +101,7 @@ class PointCloudDataset(torch.utils.data.Dataset):
             clouds = standardize(clouds, self.stats)
         item = {m: torch.from_numpy(np.ascontiguousarray(clouds[m])) for m in MODALITIES}
         item["mask"] = torch.from_numpy(self.mask[j].copy())
-        item["snapshot"] = self.cfg.snap
-        for k in ("subhalo", "group", "halo_has_2d", "central"):
+        for k in ("snapshot", "redshift", "subhalo", "group", "halo_has_2d", "central", "z0_subhalo"):
             item[k] = self.index[k][j].item()
         return item
 

@@ -19,6 +19,7 @@ class Snapshot:
         with h5py.File(self.snap_file(0), "r") as f:
             self.header = dict(f["Header"].attrs)
         self.units = Units.from_header(self.header)
+        self.redshift = float(self.header["Redshift"])
         with h5py.File(self.offsets_path, "r") as f:
             fo = f["FileOffsets/SnapByType"][()]
         self.file_offsets = fo.T if fo.shape[0] == 6 and fo.shape[1] != 6 else fo     # (files, 6); TNG stores (files, 6)
@@ -28,17 +29,7 @@ class Snapshot:
 
     def catalog(self, group_fields: list[str], subhalo_fields: list[str]) -> dict[str, np.ndarray]:
         """Requested Group/Subhalo fields, concatenated over all group-catalog files."""
-        gdir = self.root / "groupcats" / f"{self.snap:03d}"
-        paths = sorted(gdir.glob(f"fof_subhalo_tab_{self.snap:03d}.*.hdf5"), key=lambda p: int(p.name.split(".")[1]))
-        parts: dict[str, list[np.ndarray]] = {k: [] for k in group_fields + subhalo_fields}
-        for p in paths:
-            with h5py.File(p, "r") as f:
-                for grp, keys, count in (("Group", group_fields, "Ngroups_ThisFile"),
-                                         ("Subhalo", subhalo_fields, "Nsubgroups_ThisFile")):
-                    if f["Header"].attrs[count]:
-                        for k in keys:
-                            parts[k].append(f[grp][k][()])
-        return {k: np.concatenate(v) for k, v in parts.items()}
+        return read_catalog(self.root, self.snap, group_fields, subhalo_fields, expect_redshift=self.redshift)
 
     def subhalo_offsets(self, ids: np.ndarray) -> np.ndarray:
         """First snapshot row of each subhalo's particles, per type: (len(ids), 6)."""
@@ -66,3 +57,26 @@ class Snapshot:
                     yield done, {fld: f[f"PartType{ptype}/{fld}"][off:off + k] for fld in fields}
                     done, off = done + k, off + k
             j, off = j + 1, 0
+
+
+def read_catalog(root: str | Path, snap: int, group_fields: list[str], subhalo_fields: list[str],
+                 expect_redshift: float | None = None) -> dict[str, np.ndarray]:
+    """Group/Subhalo fields of a snapshot's group catalog, concatenated over its files; needs no particle files.
+    With expect_redshift, refuses a catalog of another redshift (a catalog and particles from different snapshots)."""
+    gdir = Path(root) / "groupcats" / f"{snap:03d}"
+    paths = sorted(gdir.glob(f"fof_subhalo_tab_{snap:03d}.*.hdf5"), key=lambda p: int(p.name.split(".")[1]))
+    if not paths:
+        raise FileNotFoundError(f"no group catalog files in {gdir}")
+    parts: dict[str, list[np.ndarray]] = {k: [] for k in group_fields + subhalo_fields}
+    for i, p in enumerate(paths):
+        with h5py.File(p, "r") as f:
+            z = f["Header"].attrs.get("Redshift") if i == 0 and expect_redshift is not None else None
+            if z is not None and abs(float(z) - expect_redshift) > 1e-6 * (1 + float(z)):
+                raise ValueError(f"group catalog {p.name} is at z = {float(z):g} but the snapshot at z = "
+                                 f"{expect_redshift:g}: they are not the same snapshot")
+            for grp, keys, count in (("Group", group_fields, "Ngroups_ThisFile"),
+                                     ("Subhalo", subhalo_fields, "Nsubgroups_ThisFile")):
+                if f["Header"].attrs[count]:
+                    for k in keys:
+                        parts[k].append(f[grp][k][()])
+    return {k: np.concatenate(v) for k, v in parts.items()}

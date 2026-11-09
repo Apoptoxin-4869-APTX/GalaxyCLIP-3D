@@ -119,24 +119,30 @@ python tools/audit_snapshot.py --csv data/snap099_halo_availability.csv   # ~2 m
 python tools/check_2d_selection.py 100 500 1031 2913 765                  # ~1.5 min
 ```
 
-## Point-cloud dataset v1 (our own, 2026-11-09)
+## Point-cloud dataset v3 (our own, 2026-11-09)
 
-`/cluster/projects/ska/illustris/tng50-1.pointclouds/v1/`, built from the complete snapshot copy: 5,254 galaxies
-(centrals and satellites) with four modalities, namely stars, dark matter, gas and HI, 2,048 points each, drawn
-fresh every epoch by `galaxyclip3d/dataset.py`. At the default sphere of 5 stellar half-mass radii, 5,071 galaxies
-qualify (train 4,052 / val 520 / test 499, split by halo). Fields, units, masks and caveats: **`DATASET.md`**.
-How galaxies, particles and points are selected, step by step with counts: **`SELECTION.md`**.
+`/cluster/projects/ska/illustris/tng50-1.pointclouds/v3/`, built one snapshot at a time; it holds snapshot 99, built
+from the complete snapshot copy: 5,254 galaxies (centrals and satellites) with four modalities, namely stars, dark
+matter, gas and HI, 2,048 points each, drawn fresh every epoch by `galaxyclip3d/dataset.py`. At the default sphere of
+5 stellar half-mass radii, 5,071 galaxies qualify (train 4,052 / val 520 / test 499). Up to about 262,144 (2¹⁸)
+particles are stored per type and galaxy. Every galaxy records its snapshot and redshift, and further snapshots can be
+added after the raw data of earlier ones is deleted. Splits follow galaxies through time: a galaxy's versions at
+different snapshots share the split of the z = 0 halo they end in (SubLink merger trees from the TNG API). v3 is v2
+(which replaced v1 the same day) rebuilt with this code; snapshot 99's content is unchanged, and v2 was deleted.
+Fields, units, masks, adding a snapshot and caveats: **`DATASET.md`**. How galaxies, particles and points are
+selected, step by step with counts: **`SELECTION.md`**.
 
-| Step | Code |
+| Step, per snapshot | Code |
 |---|---|
-| select galaxies, split by halo | `tools/build_selection.py` (`galaxyclip3d/pointclouds/select.py`) |
+| select galaxies, merger-tree branches, split units | `tools/build_selection.py` (`galaxyclip3d/pointclouds/select.py`, `lineage.py`, `tng_api.py`) |
 | extract particles into shards | `slurm/build_pointclouds.submit` → `tools/build_pointclouds.py` (`extract.py`, `store.py`) |
-| index, feature statistics, frozen val/test clouds | `tools/finalize_pointclouds.py` |
+| indexes, feature statistics, frozen val/test clouds | `tools/finalize_pointclouds.py` |
 | quality checks and example clouds | `tools/check_pointclouds.py` |
 | draw clouds, PyTorch loader | `galaxyclip3d/pointclouds/sampling.py`, `galaxyclip3d/dataset.py` |
 
-The build needs only numpy and h5py (`pylibs/`, see `DATASET.md`); the loader needs torch.
-`tests/test_pointclouds.py` runs the whole pipeline on a synthetic snapshot.
+Where every file lives: `galaxyclip3d/pointclouds/layout.py`. The build needs only numpy and h5py (`pylibs/`, see
+`DATASET.md`); the loader needs torch. `tests/test_pointclouds.py` runs the whole pipeline on two synthetic snapshots,
+adding the second to a dataset built from the first.
 
 ## Code shared with GalaxyCLIP-2D
 
