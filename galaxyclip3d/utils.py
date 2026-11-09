@@ -1,4 +1,4 @@
-"""Copied verbatim from GalaxyCLIP-2D (commit 8b0a377), galaxyclip/utils.py.
+"""Copied verbatim from GalaxyCLIP-2D (commit 12d8db8), galaxyclip/utils.py.
 
 Utilities: checkpointing, signal-based requeue, DDP helpers, AutoFlusher.
 

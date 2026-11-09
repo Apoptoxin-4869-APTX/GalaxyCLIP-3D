@@ -139,7 +139,7 @@ The build needs only numpy and h5py (`pylibs/`, see `DATASET.md`); the loader ne
 
 ## Code shared with GalaxyCLIP-2D
 
-Copied from GalaxyCLIP-2D commit `8b0a377` (modality-agnostic, unchanged unless noted):
+Copied from GalaxyCLIP-2D commit `12d8db8` (modality-agnostic, unchanged unless noted):
 
 | Module | Contents |
 |---|---|

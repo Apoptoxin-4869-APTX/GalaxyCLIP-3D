@@ -1,6 +1,6 @@
 #!/bin/bash
 # Template for a multi-GPU training job on the ZHAW cluster, adapted from
-# GalaxyCLIP-2D's slurm/encoder_astrom3.submit (commit 8b0a377). Copy to
+# GalaxyCLIP-2D's slurm/encoder_astrom3.submit (commit 12d8db8). Copy to
 # slurm/<name>.submit and fill in TRAIN_SCRIPT, the data staging and the overrides.
 #
 # Cluster rules this keeps (see the 2D repo's notes):

@@ -1,7 +1,7 @@
 """Training utilities: adaptive gradient clipping (ZClip), full-gallery recall, progress printing,
 memory-queue size schedule, plus a weight EMA helper.
 
-Copied verbatim from GalaxyCLIP-2D (commit 8b0a377), train_encoder_multi.py.
+Copied verbatim from GalaxyCLIP-2D (commit 12d8db8), train_encoder_multi.py.
 Keep changes deliberate: these functions produced the 2D results.
 """
 from __future__ import annotations

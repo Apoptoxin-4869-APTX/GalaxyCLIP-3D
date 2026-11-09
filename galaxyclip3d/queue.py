@@ -1,6 +1,6 @@
 """Per-domain memory queue of extra InfoNCE negatives (MoCo / XBM style).
 
-The logic is GalaxyCLIP-2D's queue (commit 8b0a377, GalaxyCLIPMultiDomain.enqueue /
+The logic is GalaxyCLIP-2D's queue (commit 12d8db8, GalaxyCLIPMultiDomain.enqueue /
 set_queue_size / queue_negatives), moved out of the model class into a standalone
 object so any encoder can use it. Behaviour is unchanged:
 

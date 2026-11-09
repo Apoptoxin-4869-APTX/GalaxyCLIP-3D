@@ -1,6 +1,6 @@
 """Contrastive losses (symmetric InfoNCE: pairwise, anchor, all-pairs) and in-batch retrieval accuracy.
 
-Copied verbatim from GalaxyCLIP-2D (commit 8b0a377), galaxyclip/models.py.
+Copied verbatim from GalaxyCLIP-2D (commit 12d8db8), galaxyclip/models.py.
 Keep changes deliberate: these functions produced the 2D results.
 """
 from __future__ import annotations
