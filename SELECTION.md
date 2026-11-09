@@ -4,7 +4,8 @@ This describes every selection step of the GalaxyCLIP-3D point-cloud dataset v1,
 the reason for it, the setting that controls it and the code that does it. Field descriptions and loading are in
 `DATASET.md`.
 
-- **Source:** TNG50-1 snapshot 99 (z = 0), complete copy at `/cluster/projects/ska/illustris/tng50-1.snap099`.
+- **Source:** TNG50-1 snapshot 99 (z = 0), complete copy at `/cluster/projects/ska/illustris/tng50-1.new`, called
+  `tng50-1.snap099` when v1 was built.
 - **Dataset:** `/cluster/projects/ska/illustris/tng50-1.pointclouds/v1`.
 - **Settings:** `configs/pc_v1.json`, copied to `config.json` in the dataset folder.
 

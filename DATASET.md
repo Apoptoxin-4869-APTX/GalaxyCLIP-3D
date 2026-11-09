@@ -1,11 +1,14 @@
 # GalaxyCLIP-3D point clouds v1 (TNG50-1, snapshot 99)
 
 `/cluster/projects/ska/illustris/tng50-1.pointclouds/v1/`, built 2026-11-09 from the complete snapshot copy
-`/cluster/projects/ska/illustris/tng50-1.snap099` with the code in `galaxyclip3d/pointclouds/` and `tools/`.
+`/cluster/projects/ska/illustris/tng50-1.new` with the code in `galaxyclip3d/pointclouds/` and `tools/`.
 Settings: `config.json` in the dataset folder (a copy of `configs/pc_v1.json`). Each shard records the code commit:
 v1 says `c0c2dca+dirty` because it was built from the then-uncommitted code that the commit adding this file contains.
 The history was rewritten on 2026-11-09 (commit messages only), so those hashes changed: `c0c2dca` is now `ba771e0`
 and the commit adding this file is `b75d3a7`.
+The snapshot folder was called `tng50-1.snap099` when v1 was built and was renamed `tng50-1.new` the same day, to hold
+further snapshots (snapshot 91 next). The build settings stored inside the shards, `selection.h5` and `index.h5` still
+name the old path; `config.json` and `configs/pc_v1.json` name the new one. The data are the same files.
 
 Every selection step, from simulation subhalos to the points of a cloud, with counts, reasons and settings, is
 described in **`SELECTION.md`**.

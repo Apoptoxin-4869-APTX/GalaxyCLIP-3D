@@ -1,5 +1,5 @@
 {
-  "root": "/cluster/projects/ska/illustris/tng50-1.snap099",
+  "root": "/cluster/projects/ska/illustris/tng50-1.new",
   "out": "/cluster/projects/ska/illustris/tng50-1.pointclouds/v1",
   "snap": 99,
   "budget": 2048,

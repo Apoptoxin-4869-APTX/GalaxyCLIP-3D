@@ -9,7 +9,7 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class Config:
-    root: str = "/cluster/projects/ska/illustris/tng50-1.snap099"      # complete snapshot copy
+    root: str = "/cluster/projects/ska/illustris/tng50-1.new"      # complete snapshot copy
     out: str = "/cluster/projects/ska/illustris/tng50-1.pointclouds/v1"
     snap: int = 99
     budget: int = 2048                      # points per modality in a cloud

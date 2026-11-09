@@ -1,10 +1,12 @@
 #!/bin/bash
-# Download a fresh copy of TNG50-1 snapshot 99 (about 2.9 TB, plus 7.4 GB of group catalog and
-# offsets) with tools/download_snapshot.py. Needs the API key in ~/.tng_api_key (mode 600).
+# Download one TNG50-1 snapshot (about 2.9 TB, plus 7.4 GB of group catalog and offsets) with
+# tools/download_snapshot.py into DEST, which can hold several snapshots side by side
+# (DEST/snapshots/NNN/, DEST/groupcats/NNN/, DEST/offsets/). Needs the API key in ~/.tng_api_key
+# (mode 600). Arguments after the script name go to the downloader, e.g. --snap 91 (default 99).
 #
-#   python3 tools/download_snapshot.py check --dest "$DEST"       # first: test key and server
-#   env -u SLURM_JOB_ID sbatch slurm/download_snapshot.submit     # start (or continue) the download
-#   python3 tools/download_snapshot.py status --dest "$DEST" --watch 10
+#   python3 tools/download_snapshot.py check --dest "$DEST" --snap 91          # first: test key and server
+#   env -u SLURM_JOB_ID sbatch slurm/download_snapshot.submit --snap 91        # start (or continue) it
+#   python3 tools/download_snapshot.py status --dest "$DEST" --snap 91 --watch 10
 #
 # To change where it goes or the parallelism: DEST=... WORKERS=... sbatch --export=ALL ...
 #
@@ -14,7 +16,7 @@
 #   * cpu partition: max 5 days. SIGUSR1 300 s before the time limit -> python stops cleanly and the
 #     job requeues itself. Finished files are kept and partial files continue, so nothing is lost.
 #   * /usr/bin/python3 and the standard library only: venvs live on per-node disks
-#SBATCH --job-name=tng50-snap99
+#SBATCH --job-name=tng50-download
 #SBATCH --time=3-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -30,7 +32,7 @@
 
 set -uo pipefail
 PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
-DEST="${DEST:-/cluster/projects/ska/illustris/tng50-1.snap099}"
+DEST="${DEST:-/cluster/projects/ska/illustris/tng50-1.new}"
 WORKERS="${WORKERS:-25}"
 mkdir -p "${PROJECT_DIR}/slurm/log"
 

@@ -52,6 +52,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_text(self, text):
+        body = text.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         Fake.requests += 1
         path = self.path.split("?")[0]
@@ -63,12 +71,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(Fake.api_faults.pop(0), {"detail": "busy"})
                 return self.send_json(200, {"name": "SIM", "num_files_snapshot": N_FILES,
                                             "num_files_groupcat": N_CATALOG})
-            if path == "/api/SIM/files/snapshot-99/":
+            if re.fullmatch(r"/api/SIM/files/snapshot-\d+/", path):           # every snapshot has the same files
                 return self.send_json(200, {"files": [f"x{i}" for i in range(N_FILES)]})
-            m = re.fullmatch(r"/api/SIM/files/(snapshot|groupcat)-99\.(\d+)\.hdf5", path)
+            m = re.fullmatch(r"/api/SIM/checksums/(snapshot|groupcat)-(\d+)/", path)
+            if m:
+                snap = int(m.group(2))
+                rows = ([(CONTENT[i], f"snap_{snap:03d}.{i}.hdf5") for i in range(N_FILES)] if m.group(1) == "snapshot"
+                        else [(CONTENT[100 + i], f"fof_subhalo_tab_{snap:03d}.{i}.hdf5") for i in range(N_CATALOG)])
+                return self.send_text("".join(f"{hashlib.sha256(c).hexdigest()}  {n}\n" for c, n in rows))
+            m = re.fullmatch(r"/api/SIM/files/(snapshot|groupcat)-\d+\.(\d+)\.hdf5", path)
             if m:
                 chunk = int(m.group(2)) + (100 if m.group(1) == "groupcat" else 0)
-            elif path == "/api/SIM/files/offsets.99.hdf5":
+            elif re.fullmatch(r"/api/SIM/files/offsets\.\d+\.hdf5", path):
                 chunk = 200
             else:
                 return self.send_json(404, {"detail": "not found"})
@@ -187,7 +201,7 @@ all_good(dest)
 assert all(r == [None] for r in Fake.ranges.values())
 st = run("status", dest, check=0).stdout
 assert f"{N_FILES} of {N_FILES} finished" in st and "100.0%" in st and "not running: all" in st, st
-no_secrets(p.stdout, p.stderr, st, *(f.read_text() for f in (dest / ".download").glob("*.json")))
+no_secrets(p.stdout, p.stderr, st, *(f.read_text() for f in (dest / ".download").rglob("*.json")))
 print("PASS download: all files correct, no .part left, status reports 100%, no key or signed URL in any output")
 
 p = run("get", dest, check=0)
@@ -272,6 +286,30 @@ st = run("status", dest, check=0).stdout
 assert f"{N_FILES + N_CATALOG + 1} of {N_FILES + N_CATALOG + 1} finished" in st, st
 print("PASS --with-catalogs: group catalog (checked against its own list) and offsets land in the same layout "
       "as the existing copy, and the checksum lists are copied along")
+
+reset()
+multi = TMP / "multi"
+nowhere = TMP / "nowhere" / "snapshots" / "099" / "checksums.txt"          # no local list: fetched from the API
+n_all = N_FILES + N_CATALOG + 1
+for snap in (99, 91):
+    run("get", multi, "--snap", str(snap), "--with-catalogs", "--checksums", str(nowhere), check=0)
+for snap in (99, 91):
+    d = multi / "snapshots" / f"{snap:03d}"
+    assert all((d / f"snap_{snap:03d}.{i}.hdf5").read_bytes() == CONTENT[i] for i in range(N_FILES)), snap
+    assert (multi / "groupcats" / f"{snap:03d}" / "checksums.txt").exists()
+    assert (multi / "offsets" / f"offsets_{snap:03d}.hdf5").read_bytes() == CONTENT[200]
+    assert (multi / ".download" / f"{snap:03d}" / "manifest.json").exists()
+manifest = json.loads((multi / ".download" / "091" / "manifest.json").read_text())
+assert not any(os.path.isabs(i["path"]) for i in manifest["items"]), "manifest paths must be relative"
+renamed = TMP / "multi_renamed"
+os.rename(multi, renamed)
+for snap in (99, 91):
+    st = run("status", renamed, "--snap", str(snap), check=0).stdout
+    assert f"{n_all} of {n_all} finished" in st and f"snapshot {snap}" in st, st
+v = run("verify", renamed, "--snap", "91", check=0).stdout
+assert f"{N_FILES + N_CATALOG} match, 0 mismatch" in v, v
+print("PASS several snapshots in one folder: separate state per snapshot, checksum lists fetched from the API "
+      "when there is no local one, and status and verify still work after the folder is renamed")
 
 # ---------------------------------------------------------------- key handling
 reset()

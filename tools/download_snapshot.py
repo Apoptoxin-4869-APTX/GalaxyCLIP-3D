@@ -1,9 +1,10 @@
 """Download a fresh, independent copy of a TNG snapshot, resumably and with a progress view.
 
-    python3 tools/download_snapshot.py check  --dest DEST            # test the key and the server
-    python3 tools/download_snapshot.py get    --dest DEST            # download; safe to restart any time
-    python3 tools/download_snapshot.py status --dest DEST --watch 10 # progress, from any node, no key needed
-    python3 tools/download_snapshot.py verify --dest DEST            # re-hash the finished files
+    python3 tools/download_snapshot.py check  --dest DEST --snap 91            # test the key and the server
+    python3 tools/download_snapshot.py get    --dest DEST --snap 91            # download; safe to restart any time
+    python3 tools/download_snapshot.py status --dest DEST --snap 91 --watch 10 # progress, any node, no key needed
+    python3 tools/download_snapshot.py verify --dest DEST --snap 91            # re-hash the finished files
+(--snap defaults to 99.)
 
 A file gets its final name only after its size and sha256 have been checked. Until then it is
 `<name>.part`, and a restart continues it, so an interrupted job can simply be run again. (The
@@ -13,9 +14,12 @@ The data servers often answer 403 or 504 to a request that works a moment later,
 These are retried, each time with a fresh redirect from the API; only the API refusing the key stops
 the job.
 
-Files go to DEST/snapshots/099/, the same layout as the existing copy, so tools/ can read it with
---root DEST once the group catalog and offsets are there too (--with-catalogs). DEST may not be
-inside the existing copy, which is only ever read: its checksums.txt files are copied from it.
+Files go to DEST/snapshots/NNN/, the same layout as the existing copy, so tools/ can read it with
+--root DEST once the group catalog and offsets are there too (--with-catalogs). Several snapshots can
+share one DEST: each keeps its own state in DEST/.download/NNN/, and the manifest there stores paths
+relative to DEST, so DEST can be renamed. DEST may not be inside the existing copy, which is only ever
+read. Checksum lists: the copy's own checksums.txt if present, else the existing copy's for that
+snapshot, else the TNG API's (/checksums/snapshot-N/ and /checksums/groupcat-N/).
 
 The API key comes from ~/.tng_api_key (mode 600) or the TNG_API_KEY environment variable, never
 from the command line, and is not written to logs or status files. It is only sent to the API's
@@ -91,8 +95,9 @@ class Item:
 
 
 # ---------------------------------------------------------------- files and state
-def state_dir(dest: Path) -> Path:
-    return dest / ".download"
+def state_dir(dest: Path, snap: int) -> Path:
+    """Lock, manifest and progress of one snapshot's download, so several snapshots can share a DEST."""
+    return dest / ".download" / f"{snap:03d}"
 
 
 def check_dest(dest: Path, snap: int) -> None:
@@ -104,29 +109,53 @@ def check_dest(dest: Path, snap: int) -> None:
             sys.exit(f"refusing to write inside the existing copy {existing}; choose another --dest")
 
 
-def read_checksums(path: Path) -> dict[str, str]:
+def parse_checksums(text: str) -> dict[str, str]:
     out = {}
-    for line in path.read_text().splitlines():
+    for line in text.splitlines():
         if line.strip():
             digest, name = line.split()
             out[name.lstrip("*")] = digest
     return out
 
 
-def checksums_for(subdir: Path, source: Path, no_checksums: bool) -> dict[str, str]:
-    """The copy's own checksums.txt, created from `source` (read-only) on the first run."""
-    own = subdir / "checksums.txt"
-    if no_checksums:
+def checksum_text(args, kind: str, opener, key: str) -> tuple[str, str]:
+    """(text, where from) of the checksum list of `kind` ('snapshot' or 'groupcat') for args.snap: the copy's own,
+    else the existing copy's (or the one given with --checksums), else the TNG API's."""
+    sub = "snapshots" if kind == "snapshot" else "groupcats"
+    own = args.dest / sub / f"{args.snap:03d}" / "checksums.txt"
+    if own.exists():
+        return own.read_text(), str(own)
+    base = Path(args.checksums).parents[2] if args.checksums else EXISTING
+    local = (Path(args.checksums) if args.checksums and kind == "snapshot"
+             else base / sub / f"{args.snap:03d}" / "checksums.txt")
+    if local.exists():
+        return local.read_text(), str(local)
+    url = f"{args.api_base.rstrip('/')}/checksums/{kind}-{args.snap}/"
+    req = urllib.request.Request(url, headers={"api-key": key, "User-Agent": USER_AGENT})
+    try:
+        with opener.open(req, timeout=args.timeout) as r:
+            return r.read().decode(), public(url)
+    except (urllib.error.HTTPError, OSError, http.client.HTTPException) as e:
+        sys.exit(f"no {kind} checksum list at {local} or {public(url)} ({e}); "
+                 f"pass --no-checksums to rely on file sizes only")
+
+
+def checksums_for(args, kind: str, subdir: Path, opener, key: str) -> dict[str, str]:
+    """The copy's own checksums.txt, written on the first run from the best available source."""
+    if args.no_checksums:
         return {}
+    own = subdir / "checksums.txt"
     if not own.exists():
-        if not source.exists():
-            sys.exit(f"no checksum list at {source}; pass --no-checksums to rely on file sizes only")
+        text, _ = checksum_text(args, kind, opener, key)
+        parse_checksums(text)                   # refuses a malformed list before anything is written
         subdir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, own)
-    return read_checksums(own)
+        tmp = own.with_name("checksums.txt.part")
+        tmp.write_text(text)
+        os.replace(tmp, own)
+    return parse_checksums(own.read_text())
 
 
-def build_items(args, meta: dict) -> list[Item]:
+def build_items(args, meta: dict, opener, key: str) -> list[Item]:
     dest, snap, base = args.dest, args.snap, args.api_base.rstrip("/")
     snap_dir, gc_dir = dest / "snapshots" / f"{snap:03d}", dest / "groupcats" / f"{snap:03d}"
     items: list[Item] = []
@@ -143,11 +172,10 @@ def build_items(args, meta: dict) -> list[Item]:
                 sys.exit(f"{name} is not in the {kind} checksum list")
             items.append(Item(kind, name, f"{base}/files/{api_name}-{snap}.{i}.hdf5", str(subdir / name), digest))
 
-    sums = checksums_for(snap_dir, Path(args.checksums), args.no_checksums)
+    sums = checksums_for(args, "snapshot", snap_dir, opener, key)
     add_chunks("snapshot", "snapshot", "snap", snap_dir, sums, meta.get("num_files_snapshot"))
     if args.with_catalogs:      # last: 681 small files, whose speed says nothing about the time left for the snapshot
-        sums = checksums_for(gc_dir, Path(args.checksums).parents[2] / "groupcats" / f"{snap:03d}" / "checksums.txt",
-                             args.no_checksums)
+        sums = checksums_for(args, "groupcat", gc_dir, opener, key)
         add_chunks("groupcat", "groupcat", "fof_subhalo_tab", gc_dir, sums, meta.get("num_files_groupcat"))
         name = f"offsets_{snap:03d}.hdf5"
         items.append(Item("offsets", name, f"{base}/files/offsets.{snap}.hdf5", str(dest / "offsets" / name), None))
@@ -297,8 +325,8 @@ def expected_total(resp, offset: int) -> int | None:
 class Progress:
     """Thread-safe counters, written to DEST/.download/progress.json for `status`."""
 
-    def __init__(self, dest: Path, items: list[Item], workers: int):
-        self.path = state_dir(dest) / "progress.json"
+    def __init__(self, dest: Path, snap: int, items: list[Item], workers: int):
+        self.path = state_dir(dest, snap) / "progress.json"
         self.items = items
         self.lock = threading.Lock()
         self.active: dict[str, dict] = {}
@@ -516,26 +544,28 @@ def log(message: str) -> None:
 def cmd_get(args) -> int:
     check_dest(args.dest, args.snap)
     key = load_key()
-    meta = get_json(make_opener(args.api_base), args.api_base.rstrip("/") + "/", key, args)
-    args.dest.mkdir(parents=True, exist_ok=True)
-    state_dir(args.dest).mkdir(exist_ok=True)
+    opener = make_opener(args.api_base)
+    meta = get_json(opener, args.api_base.rstrip("/") + "/", key, args)
+    sd = state_dir(args.dest, args.snap)
+    sd.mkdir(parents=True, exist_ok=True)
 
-    lock = open(state_dir(args.dest) / "lock", "w")
+    lock = open(sd / "lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit(f"another download is already writing to {args.dest}")
+        sys.exit(f"another download of snapshot {args.snap} is already writing to {args.dest}")
     except OSError as e:
-        print(f"WARNING: cannot lock {args.dest} ({e}); make sure only one download runs there", flush=True)
+        print(f"WARNING: cannot lock {sd} ({e}); make sure only one download runs there", flush=True)
 
-    items = build_items(args, meta)
+    items = build_items(args, meta, opener, key)
     if not items:
         sys.exit("no files to download: the API gave no file count and there is no checksum list")
-    write_json(state_dir(args.dest) / "manifest.json", {"snap": args.snap, "items": [asdict(i) for i in items]})
+    write_json(sd / "manifest.json", {"snap": args.snap, "items": [{**asdict(i), "path": os.path.relpath(i.path, args.dest)}
+                                                                  for i in items]})
     for it in items:
         Path(it.path).parent.mkdir(parents=True, exist_ok=True)
 
-    progress = Progress(args.dest, items, args.workers)
+    progress = Progress(args.dest, args.snap, items, args.workers)
     done, on_disk, total = scan(items, progress.sizes)
     free = shutil.disk_usage(args.dest).free
     if total - on_disk > free:
@@ -607,10 +637,9 @@ def cmd_check(args) -> int:
     files = listing.get("files", listing) if isinstance(listing, dict) else listing
     print(f"file list: {len(files) if hasattr(files, '__len__') else '?'} entries")
 
-    source = args.dest / "snapshots" / f"{args.snap:03d}" / "checksums.txt"
-    source = source if source.exists() else Path(args.checksums)
-    sums = read_checksums(source) if source.exists() else {}
-    print(f"checksums: {len(sums)} entries in {source}" if sums else f"checksums: none found at {source}")
+    found = None if args.no_checksums else checksum_text(args, "snapshot", opener, key)
+    sums = parse_checksums(found[0]) if found else {}
+    print(f"checksums: {len(sums)} entries from {found[1]}" if found else "checksums: not used (--no-checksums)")
     if sums and meta.get("num_files_snapshot") not in (None, len(sums)):
         print(f"WARNING: the API says {meta['num_files_snapshot']} files, the checksum list {len(sums)}")
 
@@ -650,20 +679,21 @@ def cmd_check(args) -> int:
     return 0 if resumable and head == HDF5_SIGNATURE else 1
 
 
-def load_state(dest: Path) -> tuple[list[Item], dict]:
-    manifest = state_dir(dest) / "manifest.json"
+def load_state(dest: Path, snap: int) -> tuple[list[Item], dict]:
+    sd = state_dir(dest, snap)
+    manifest = sd / "manifest.json"
     if not manifest.exists():
-        sys.exit(f"no download has started at {dest} (no {manifest})")
-    items = [Item(**i) for i in json.loads(manifest.read_text())["items"]]
-    path = state_dir(dest) / "progress.json"
+        sys.exit(f"no download of snapshot {snap} has started at {dest} (no {manifest})")
+    # paths are relative to DEST (absolute ones from older manifests are kept as they are)
+    items = [Item(**{**i, "path": str(dest / i["path"])}) for i in json.loads(manifest.read_text())["items"]]
     try:
-        return items, json.loads(path.read_text())
+        return items, json.loads((sd / "progress.json").read_text())
     except (OSError, ValueError):
         return items, {}
 
 
-def render_status(dest: Path) -> str:
-    items, st = load_state(dest)
+def render_status(dest: Path, snap: int) -> str:
+    items, st = load_state(dest, snap)
     sizes = st.get("sizes", {})
     done, on_disk, total = scan(items, sizes)
     frac = on_disk / total if total else 0.0
@@ -671,7 +701,7 @@ def render_status(dest: Path) -> str:
     age = time.time() - st.get("updated", 0)
     running = bool(st) and not st.get("finished") and age < 120
     speed = st.get("speed", 0.0) if running else 0.0
-    lines = [f"Download to {dest}",
+    lines = [f"Download of snapshot {snap} to {dest}",
              f"[{bar}] {frac:.1%}",
              f"files    {done} of {len(items)} finished and checked    retries so far {st.get('retries', 0)}    "
              f"failed {len(st.get('failed', {}))}",
@@ -708,7 +738,7 @@ def render_status(dest: Path) -> str:
 
 def cmd_status(args) -> int:
     while True:
-        text = render_status(args.dest)
+        text = render_status(args.dest, args.snap)
         if args.watch and sys.stdout.isatty():
             print("\033[2J\033[H" + stamp() + "\n" + text, flush=True)
         else:
@@ -723,7 +753,7 @@ def cmd_status(args) -> int:
 
 def cmd_verify(args) -> int:
     """Recompute the sha256 of every finished file; reads only, deletes nothing."""
-    items, _ = load_state(args.dest)
+    items, _ = load_state(args.dest, args.snap)
     todo = queue.Queue()
     for it in items:
         if os.path.exists(it.path):
@@ -780,8 +810,9 @@ def main() -> int:
     ap.add_argument("--state-every", type=float, default=10, help="seconds between progress.json updates")
     ap.add_argument("--watch", type=float, help="status: refresh every this many seconds")
     ap.add_argument("--probe-mib", type=int, default=64, help="check: MiB to read when measuring the speed")
-    ap.add_argument("--checksums", default=str(EXISTING / "snapshots" / "099" / "checksums.txt"),
-                    help="checksum list to copy into the new copy (read-only)")
+    ap.add_argument("--checksums", help="snapshot checksum list to use when the copy has none; its group-catalog "
+                                        "list is taken from the same root (default: the existing copy's for "
+                                        "--snap, else the TNG API's)")
     ap.add_argument("--no-checksums", action="store_true", help="check file sizes only")
     ap.add_argument("--api-base", default=API_BASE)
     args = ap.parse_args()
