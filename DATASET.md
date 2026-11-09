@@ -4,6 +4,8 @@
 `/cluster/projects/ska/illustris/tng50-1.snap099` with the code in `galaxyclip3d/pointclouds/` and `tools/`.
 Settings: `config.json` in the dataset folder (a copy of `configs/pc_v1.json`). Each shard records the code commit:
 v1 says `c0c2dca+dirty` because it was built from the then-uncommitted code that the commit adding this file contains.
+The history was rewritten on 2026-11-09 (commit messages only), so those hashes changed: `c0c2dca` is now `ba771e0`
+and the commit adding this file is `b75d3a7`.
 
 ## What is in it
 
