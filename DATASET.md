@@ -7,6 +7,9 @@ v1 says `c0c2dca+dirty` because it was built from the then-uncommitted code that
 The history was rewritten on 2026-11-09 (commit messages only), so those hashes changed: `c0c2dca` is now `ba771e0`
 and the commit adding this file is `b75d3a7`.
 
+Every selection step, from simulation subhalos to the points of a cloud, with counts, reasons and settings, is
+described in **`SELECTION.md`**.
+
 ## What is in it
 
 | File | Contents |

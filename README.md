@@ -125,6 +125,7 @@ python tools/check_2d_selection.py 100 500 1031 2913 765                  # ~1.5
 (centrals and satellites) with four modalities, namely stars, dark matter, gas and HI, 2,048 points each, drawn
 fresh every epoch by `galaxyclip3d/dataset.py`. At the default sphere of 5 stellar half-mass radii, 5,071 galaxies
 qualify (train 4,052 / val 520 / test 499, split by halo). Fields, units, masks and caveats: **`DATASET.md`**.
+How galaxies, particles and points are selected, step by step with counts: **`SELECTION.md`**.
 
 | Step | Code |
 |---|---|
