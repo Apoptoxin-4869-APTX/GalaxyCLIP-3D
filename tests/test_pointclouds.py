@@ -454,8 +454,39 @@ else:
             assert np.array_equal(dv[i]["stars"].numpy(), dv[i]["stars"].numpy()), "frozen clouds must not change"
             seen.add(dv[i]["snapshot"])
     assert seen == {91, 99}, seen
+    from galaxyclip3d.dataset import galaxy_masks
+    from galaxyclip3d.pointclouds.layout import frozen_path
+    b2 = cfg.budget // 2                                  # another point count, with frozen sets of its own
+    kept = [out / "index.h5", out / "snapshots.json", out / "feature_stats.json", s99 / "index.h5",
+            *sorted((s99 / "frozen").glob("*.h5"))]
+    before = {p: p.read_bytes() for p in kept}
+    for sn in (99, 91):
+        run(REPO / "tools" / "finalize_pointclouds.py", "--out", out, "--snap", sn, "--radius", 10, "--budget", b2,
+            "--frozen-only")
+    assert all(p.read_bytes() == v for p, v in before.items()), "--frozen-only leaves every other file alone"
+    assert frozen_path(out, 99, "val", R, b2).exists() and frozen_path(out, 91, "test", R, b2).exists()
+    for split in ("train", "val"):
+        dh = PointCloudDataset(out, split, radius=R, budget=b2)
+        assert all(dh[0][m].shape == (b2, len(FEATURES[m])) for m in MODALITIES), split
+    try:
+        PointCloudDataset(out, "val", radius=R, budget=b2 + 1)
+        raise AssertionError("a point count without frozen sets must be refused")
+    except FileNotFoundError:
+        pass
+    both = PointCloudDataset(out, "train", radius=R, common_radii=[5.0])
+    u10, m10 = galaxy_masks(every, cfg, 10.0)
+    u5, m5 = galaxy_masks(every, cfg, 5.0)
+    assert np.array_equal(both.rows, np.flatnonzero(u10 & u5 & (every["split"] == 0)))
+    assert np.array_equal(both.mask, m10 & m5)
+    s7a, s7b, s8 = (PointCloudDataset(out, "train", radius=R, draw_seed=s) for s in (7, 7, 8))
+    assert all(np.array_equal(s7a[i][m].numpy(), s7b[i][m].numpy()) for i in range(3) for m in MODALITIES), \
+        "a draw seed fixes each training galaxy's draw and orientation"
+    assert not np.array_equal(s7a[0]["stars"].numpy(), s8[0]["stars"].numpy()), "another seed draws otherwise"
+    assert not np.array_equal(ds[0]["stars"].numpy(), ds[0]["stars"].numpy()), "without a seed every call draws anew"
     print("PASS loader: both snapshots or one, snapshot in every item, shapes, masks, mass-balanced sampler, frozen "
-          "validation clouds per snapshot")
+          "validation clouds per snapshot; another point count with its own frozen sets (--frozen-only touches "
+          "nothing else, a count without them is refused); galaxies usable at several spheres; a draw seed makes "
+          "training draws reproducible")
 
 if os.environ.get("KEEP_TMP"):                    # KEEP_TMP=1 keeps the synthetic data and datasets to look at
     print("kept", TMP)

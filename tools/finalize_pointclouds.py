@@ -3,6 +3,11 @@ dataset index over all snapshots, feature statistics (first snapshot only) and f
 
     PYTHONPATH=pylibs python3 -s tools/finalize_pointclouds.py --out DIR --snap 99 [--radius 5] [--stats-galaxies 1000]
                                                                                   [--recompute-stats]
+    PYTHONPATH=pylibs python3 -s tools/finalize_pointclouds.py --out DIR --snap 99 --radius 3 [--budget 1024] --frozen-only
+
+--frozen-only writes only the frozen sets of an already finalized snapshot, for another sphere (--radius) or another
+number of points per cloud (--budget, written as frozen/<split>_r<radius>_p<budget>.h5 next to the default sets); it
+leaves the indexes, feature statistics and snapshots.json alone, so it is safe while training jobs copy the dataset.
 
 Writes OUT/snap_NNN/index.h5, OUT/snap_NNN/frozen/{val,test}_r<radius>.h5, and rebuilds OUT/index.h5 and
 OUT/snapshots.json from every finalized snapshot. OUT/feature_stats.json is computed from training galaxies when the
@@ -67,12 +72,34 @@ def build_dataset_index(out: Path) -> dict[str, np.ndarray]:
     return {k: np.concatenate([t[k] for t in tables]) for k in tables[0]}
 
 
-def clouds_of(out: Path, index: dict, j: int, cfg: Config, radius: float, rng, rotate: bool, shards: dict):
+def clouds_of(out: Path, index: dict, j: int, cfg: Config, radius: float, rng, rotate: bool, shards: dict,
+              budget: int | None = None):
     key = (int(index["snapshot"][j]), int(index["shard"][j]))
     if key not in shards:
         shards[key] = Shard(shard_path(out, *key))
     parts = {n: shards[key].particles(int(index["row"][j]), n) for n in ("stars", "dm", "gas")}
-    return draw(parts, radius * float(index["rhalf_star_kpc"][j]), float(index["vmax"][j]), cfg.budget, rng, rotate)
+    return draw(parts, radius * float(index["rhalf_star_kpc"][j]), float(index["vmax"][j]),
+                cfg.budget if budget is None else budget, rng, rotate)
+
+
+def write_frozen(out: Path, snap: int, index: dict, usable: np.ndarray, mask: np.ndarray, cfg: Config, radius: float,
+                 budget: int, shards: dict) -> None:
+    """Frozen validation and test clouds at `radius`, `budget` points each (another budget than the config's gets
+    its own file name)."""
+    (snapshot_dir(out, snap) / "frozen").mkdir(exist_ok=True)
+    for code, split in enumerate(SPLITS[1:], start=1):
+        rows = np.flatnonzero(usable & (index["split"] == code))
+        data = {m: np.zeros((len(rows), budget, len(FEATURES[m])), dtype=np.float32) for m in MODALITIES}
+        for i, j in enumerate(rows):
+            c = clouds_of(out, index, j, cfg, radius, np.random.default_rng([cfg.seed, int(index["subhalo"][j]), 1]),
+                          False, shards, budget)
+            for m in MODALITIES:
+                data[m][i] = c[m]
+        data.update(snapshot=index["snapshot"][rows], subhalo=index["subhalo"][rows], mask=mask[rows])
+        path = frozen_path(out, snap, split, radius, budget if budget != cfg.budget else None)
+        write_table(path, data, {"radius": radius, "budget": budget, "features": json.dumps(FEATURES),
+                                 "snapshot": snap}, group=None)
+        print(f"frozen {split}: {len(rows)} galaxies, {budget} points per cloud ({path.name})", flush=True)
 
 
 def feature_stats(out: Path, index: dict, usable: np.ndarray, mask: np.ndarray, cfg: Config, radius: float,
@@ -108,17 +135,31 @@ def main() -> None:
     ap.add_argument("--radius", type=float, help="sphere for stats and frozen clouds (default: the config's)")
     ap.add_argument("--stats-galaxies", type=int, default=1000, help="training galaxies used for feature statistics")
     ap.add_argument("--recompute-stats", action="store_true", help="recompute feature statistics from all snapshots")
+    ap.add_argument("--budget", type=int, help="points per frozen cloud (default: the config's)")
+    ap.add_argument("--frozen-only", action="store_true",
+                    help="only write frozen sets of a finalized snapshot (indexes, statistics, snapshots.json untouched)")
     args = ap.parse_args()
     out, snap = args.out, args.snap
     sdir = snapshot_dir(out, snap)
     cfg = Config.load(sdir / "config.json")
     radius = cfg.train_radius if args.radius is None else args.radius
+    budget = cfg.budget if args.budget is None else args.budget
+    if radius not in cfg.radii or budget < 1:
+        sys.exit(f"--radius must be one of {cfg.radii} and --budget positive")
     sel = read_table(sdir / "selection.h5")
     n_shards = int(sel["shard"].max()) + 1
     missing = [s for s in range(n_shards) if not shard_path(out, snap, s).exists()]
     if missing:
         sys.exit(f"{len(missing)} shards of snapshot {snap} missing, e.g. {missing[:10]}; run "
                  f"tools/build_pointclouds.py --snap {snap} first")
+    if args.frozen_only:
+        if not (sdir / "index.h5").exists():
+            sys.exit(f"snapshot {snap} is not finalized yet: run without --frozen-only first")
+        index = read_table(sdir / "index.h5")
+        usable, mask = masks(index, cfg, radius)
+        print(f"snapshot {snap}: usable at {radius:g} R1/2,*: {usable.sum():,}", flush=True)
+        write_frozen(out, snap, index, usable, mask, cfg, radius, budget, {})
+        return
 
     index = build_snapshot_index(out, snap, n_shards)
     attrs = {"config": cfg.to_json(), "splits": ",".join(SPLITS), "snapshot": snap,
@@ -149,20 +190,7 @@ def main() -> None:
     else:
         print(f"feature statistics kept from {json.loads(stats_path.read_text())['_meta']}", flush=True)
 
-    (sdir / "frozen").mkdir(exist_ok=True)
-    for code, split in enumerate(SPLITS[1:], start=1):
-        rows = np.flatnonzero(usable & (index["split"] == code))
-        data = {m: np.zeros((len(rows), cfg.budget, len(FEATURES[m])), dtype=np.float32) for m in MODALITIES}
-        for i, j in enumerate(rows):
-            c = clouds_of(out, index, j, cfg, radius, np.random.default_rng([cfg.seed, int(index["subhalo"][j]), 1]),
-                          False, shards)
-            for m in MODALITIES:
-                data[m][i] = c[m]
-        data.update(snapshot=index["snapshot"][rows], subhalo=index["subhalo"][rows], mask=mask[rows])
-        write_table(frozen_path(out, snap, split, radius), data,
-                    {"radius": radius, "budget": cfg.budget, "features": json.dumps(FEATURES), "snapshot": snap},
-                    group=None)
-        print(f"frozen {split}: {len(rows)} galaxies", flush=True)
+    write_frozen(out, snap, index, usable, mask, cfg, radius, budget, shards)
 
     summary, prev = {}, _previous(out)
     for s in snapshots_in(out, "index.h5"):

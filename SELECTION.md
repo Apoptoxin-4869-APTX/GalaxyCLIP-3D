@@ -170,11 +170,14 @@ Tracers add 0.16 TB to the snapshot's 2.93 TB and are not used.
 5. **Scaling.** Positions are divided by the sphere radius, so every cloud fills a sphere of radius 1. Velocities are divided by
    the galaxy's `SubhaloVmax`. Age, metallicity, density, temperature and field strength are standardized with the
    mean and spread of 1,000 training galaxies (`feature_stats.json`).
-6. **Rotation.** Training clouds get one random rotation per galaxy, the same for all four modalities. Validation and test clouds are
-   drawn once, unrotated (each snapshot's `frozen/`, seed (4869, subhalo, 1); 520 and 499 galaxies at 5 radii for
-   snapshot 99).
-   *Caveat:* because a galaxy's four clouds share an orientation, a contrastive model can match them by orientation
-   instead of physics. Independent rotations per modality are not implemented yet.
+6. **Rotation.** Every modality gets its own random rotation, and a mirror image half of the time (`orient()` in
+   `sampling.py`); training draws a new one each time. Validation and test clouds are drawn once, unrotated (each
+   snapshot's `frozen/`, seed (4869, subhalo, 1); 520 and 499 galaxies at 5 radii for
+   snapshot 99); when loaded, each of their clouds gets a fixed rotation of its own, seeded by (4869, snapshot,
+   subhalo, 11), so evaluation stays identical. Why independent: with one shared orientation a model could match the
+   four clouds by which way the galaxy points instead of by physics. Matching only the direction of the stars' and the
+   gas's angular momentum finds the right galaxy for 35% of the 394 validation galaxies with gas (chance 0.25%), and
+   for 0.3% after independent rotations (`tools/clip_baselines.py`).
 
 Each training draw is new, so over the epochs a large galaxy is seen through many different subsets of its particles.
 

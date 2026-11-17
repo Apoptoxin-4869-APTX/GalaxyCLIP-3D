@@ -8,7 +8,12 @@
 Positions are divided by the sphere radius and velocities by the galaxy's maximum circular velocity. Every draw is
 weighted by wcorr, which undoes the capping in extract.py. Gas and HI points are moved to a random place inside their
 cell's sphere, so the two clouds never share exact coordinates. HI is drawn with replacement, because a few cells can
-hold most of the neutral gas; the others without. One random rotation is applied to all modalities of a galaxy.
+hold most of the neutral gas; the others without.
+
+Orientation: draw() can turn all four clouds by one random rotation, but then they share an orientation and can be
+matched by it instead of by physics (matching only the direction of the stars' and the gas's angular momentum finds
+the right galaxy among 394 for 35% of them). orient() gives every modality its own random rotation, and with mirror
+also a reflection half of the time; that is what training uses.
 """
 from __future__ import annotations
 
@@ -20,6 +25,21 @@ SCALARS = {"stars": ("age", "log_z"), "dm": (), "gas": ("log_nh", "log_t", "log_
            "hi": ("x_hi",)}
 FEATURES = {m: ("x", "y", "z", "vx", "vy", "vz") + SCALARS[m] for m in MODALITIES}
 STANDARDIZE = {"stars": ("age", "log_z"), "gas": ("log_nh", "log_t", "log_z", "log_b")}
+INPUTS = ("all", "no_velocities", "no_scalars")
+
+
+def input_columns(modality: str, inputs: str = "all") -> list[int]:
+    """Columns of FEATURES[modality] an encoder sees, for input ablations: everything, positions and the physical
+    values (no_velocities), or positions and velocities (no_scalars). Positions stay first, where the patch encoder
+    expects them."""
+    n = len(FEATURES[modality])
+    if inputs == "all":
+        return list(range(n))
+    if inputs == "no_velocities":
+        return [0, 1, 2, *range(6, n)]
+    if inputs == "no_scalars":
+        return list(range(6))
+    raise ValueError(f"inputs must be one of {INPUTS}, got {inputs!r}")
 
 
 def weights(modality: str, p: dict[str, np.ndarray]) -> np.ndarray:
@@ -44,6 +64,41 @@ def random_rotation(rng: np.random.Generator) -> np.ndarray:
     return np.array([[a * a + b * b - c * c - d * d, 2 * (b * c - a * d), 2 * (b * d + a * c)],
                      [2 * (b * c + a * d), a * a - b * b + c * c - d * d, 2 * (c * d - a * b)],
                      [2 * (b * d - a * c), 2 * (c * d + a * b), a * a - b * b - c * c + d * d]])
+
+
+ORIENTATIONS = ("independent", "shared", "none")
+
+
+def random_orthogonal(rng: np.random.Generator, mirror: bool = True) -> np.ndarray:
+    """A uniform random rotation; with mirror, also a reflection (determinant -1) half of the time. Gravity and gas
+    dynamics look the same in a mirror, and galaxies turn either way, so a mirrored galaxy is still a valid one."""
+    r = random_rotation(rng)
+    if mirror and rng.random() < 0.5:
+        r = r.copy()
+        r[:, 0] = -r[:, 0]
+    return r
+
+
+def orient(clouds: dict[str, np.ndarray], rng: np.random.Generator, mode: str = "independent",
+           mirror: bool = True) -> dict[str, np.ndarray]:
+    """Turn positions and velocities (columns 0-2 and 3-5) of each cloud: every modality by its own random matrix
+    ("independent"), all by one ("shared"), or not at all ("none"). Random numbers are drawn in MODALITIES order
+    whether or not a cloud is empty, so a seeded rng gives the same result every time."""
+    if mode not in ORIENTATIONS:
+        raise ValueError(f"orientation must be one of {ORIENTATIONS}, not {mode!r}")
+    if mode == "none":
+        return dict(clouds)
+    shared = random_orthogonal(rng, mirror) if mode == "shared" else None
+    out = {}
+    for mod in MODALITIES:
+        if mod not in clouds:
+            continue
+        r = shared if shared is not None else random_orthogonal(rng, mirror)
+        c = np.array(clouds[mod], dtype=np.float32, copy=True)
+        c[:, 0:3] = c[:, 0:3] @ r.T
+        c[:, 3:6] = c[:, 3:6] @ r.T
+        out[mod] = c
+    return out
 
 
 def in_ball(rng: np.random.Generator, n: int) -> np.ndarray:

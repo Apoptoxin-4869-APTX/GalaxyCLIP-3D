@@ -30,8 +30,9 @@ def shard_path(out: str | Path, snap: int, shard: int) -> Path:
     return snapshot_dir(out, snap) / "shards" / f"shard_{int(shard):04d}.h5"
 
 
-def frozen_path(out: str | Path, snap: int, split: str, radius: float) -> Path:
-    return snapshot_dir(out, snap) / "frozen" / f"{split}_r{radius:g}.h5"
+def frozen_path(out: str | Path, snap: int, split: str, radius: float, budget: int | None = None) -> Path:
+    """Frozen validation or test clouds; `budget` names a set with another number of points than the dataset's."""
+    return snapshot_dir(out, snap) / "frozen" / (f"{split}_r{radius:g}" + (f"_p{budget}" if budget else "") + ".h5")
 
 
 def snapshots_in(out: str | Path, need: str = "selection.h5") -> list[int]:
