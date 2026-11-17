@@ -1,0 +1,68 @@
+#!/bin/bash
+# Train the multi-modal contrastive model on one GPU (galaxyclip3d/train_clip.py).
+#
+#   env -u SLURM_JOB_ID sbatch slurm/train_clip.submit configs/clip_pointnet.json [--set key=value ...]
+#
+# The dataset (47 GB) is copied to the job's local /scratch first (1-2 min): reading it from the shared storage is
+# about 450 ms per galaxy cold, against about 27 ms from memory, and data feeding sets the pace. Checkpoints go to the
+# config's out_dir in the repo; a requeued job resumes from its latest.pt.
+#
+# Cluster rules this keeps:
+#   * --account=cai_ivs and --gres-flags=enforce-binding on every GPU job; submit with `env -u SLURM_JOB_ID sbatch`
+#   * trinity stays free for the 2D work, fresko is for figures, irvine has AMD cards: they are excluded, which leaves
+#     sacramento (A100) and sanjose (H100) in gpu_top
+#   * /scratch is private per job; never stage into /raid/persistent_scratch (30 GB cap)
+#   * time limit 24 h; SIGUSR1 300 s before it -> python saves latest.pt and exits 3 -> the job requeues itself
+#   * python: the tts-fish venv on /cluster/home (torch 2.8, CUDA 12.8) with numpy/h5py from the repo's pylibs/
+#SBATCH --job-name=clip3d
+#SBATCH --partition=gpu_top
+#SBATCH --exclude=trinity,fresko,irvine
+#SBATCH --gres=gpu:1
+#SBATCH --gres-flags=enforce-binding
+#SBATCH --account=cai_ivs
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=120G
+#SBATCH --time=24:00:00
+#SBATCH --signal=B:SIGUSR1@300
+#SBATCH --requeue
+#SBATCH --open-mode=append
+#SBATCH --output=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/clip_%j.out
+#SBATCH --error=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/clip_%j.out
+
+set -uo pipefail
+PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
+PYTHON=/cluster/home/magilolg/venvs/tts-fish/bin/python
+SOURCE_DATA=/cluster/projects/ska/illustris/tng50-1.pointclouds/v3
+DATA="/scratch/${USER}/pointclouds_v3"
+CONFIG="${1:?give the config file as the first argument}"
+shift
+WORKERS="${WORKERS:-16}"
+
+sig_handler_USR1() {
+    echo "STOP SIGNAL DETECTED — $(date)"
+    if [[ -n "${PY_PID:-}" ]]; then
+        kill -USR1 "${PY_PID}" 2>/dev/null || true
+        for i in $(seq 1 150); do kill -0 "${PY_PID}" 2>/dev/null || break; sleep 1; done
+    fi
+    scontrol requeue "${SLURM_JOB_ID}"
+    exit 0
+}
+trap 'sig_handler_USR1' USR1
+
+echo "[clip] $(date) on $(hostname), job ${SLURM_JOB_ID:-none}, config ${CONFIG} $*"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+mkdir -p "${DATA}"
+t0=$(date +%s)
+rsync -a "${SOURCE_DATA}/" "${DATA}/"
+echo "[stage] $(du -sh "${DATA}" | cut -f1) copied to local disk in $(( $(date +%s) - t0 )) s"
+
+cd "${PROJECT_DIR}"
+PYTHONPATH="${PROJECT_DIR}/pylibs:${PROJECT_DIR}" "${PYTHON}" -s -u -m galaxyclip3d.train_clip --config "${CONFIG}" \
+    --set data="${DATA}" workers="${WORKERS}" "$@" &
+PY_PID=$!
+wait ${PY_PID}
+rc=$?
+[[ ${rc} -eq 3 ]] && exit 0          # stopped for requeue; the trap requeues
+exit ${rc}

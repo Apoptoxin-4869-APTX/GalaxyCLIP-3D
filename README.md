@@ -202,6 +202,84 @@ little gain.
 | `tools/cap_study.py` | particles per galaxy, and what each storage cap from 2¹² to 2²³ costs in size and accuracy | `outputs/cap_study/` |
 | `tools/check_pointclouds.py --pdf` | one drawn cloud per modality for 12 galaxies across stellar mass | `snap_NNN/qa_clouds.pdf` in the dataset |
 
+## Contrastive alignment of the four modalities (started 2026-11-13)
+
+Goal: one encoder per modality (stars, dark matter, gas, HI) so that a galaxy's four clouds land close together in a
+shared 512-d space, as GalaxyCLIP-2D did for its 7 maps. The metric is full-gallery recall R@1/5/10 per modality
+pair over the 520 validation galaxies, each pair over the galaxies that have both modalities (galleries: 520 with
+dark matter, 394 with gas, 472 with HI), reported as a mean over the 12 directions with and without gas↔HI (both are
+drawn from the same gas cells, like 2D's hi/hi-21cm). The 499 test galaxies are kept for the final numbers.
+
+**Orientation.** Every modality gets its own random rotation (and a mirror image half of the time); see `DATASET.md`.
+With one shared orientation, matching only the direction of angular momentum, no learning, already finds the right
+galaxy for 35% (stars→gas), 31% (stars→HI) and 10% (stars→dark matter) of the validation galaxies.
+
+**Baselines without a network** (`tools/clip_baselines.py`, validation set, chance 0.23%):
+
+| Baseline | R@1, mean over pairs | without gas↔HI |
+|---|---|---|
+| angular-momentum direction, clouds in a shared frame | 29.9% | 19.0% |
+| angular-momentum direction, independent rotations | 0.3% | 0.2% |
+| about 20 orientation-free statistics per cloud + CCA per pair, fitted on the training set | 15.2% | 4.0% |
+
+| Piece | Code |
+|---|---|
+| masked all-pairs InfoNCE, masked full-gallery recall (2D functions untouched) | `galaxyclip3d/multimodal.py` |
+| encoders: PointNet (1.2 M parameters per modality), patch transformer à la Point-MAE (11.9 M) | `galaxyclip3d/models/` |
+| training (one GPU, bf16, AdamW + cosine, ZClip, optional EMA, requeue, W&B optional) | `galaxyclip3d/train_clip.py`, `configs/clip_*.json` |
+| job: copies the dataset to the node's local disk, excludes trinity, fresko and irvine | `slurm/train_clip.submit` |
+| properties for probes (halo mass, SFR, metallicities, colour, stellar age, HI mass) | `tools/build_targets.py` → `snap_099/targets.h5` |
+| tests (orientation, masked loss and recall, encoders, ablation options, a short synthetic training run, scoring and probe helpers) | `tests/test_clip.py` |
+
+```bash
+env -u SLURM_JOB_ID sbatch slurm/train_clip.submit configs/clip_pointnet.json                    # PointNet baseline
+env -u SLURM_JOB_ID sbatch slurm/train_clip.submit configs/clip_patch.json --set lr=3e-4 batch_size=512
+```
+
+The trainer evaluates the untrained model first (epoch 0), then every `eval_every` epochs; `control=shuffle_pairs`
+re-pairs galaxies at random as a leak test (validation must stay at chance) and `rotation=shared` measures the
+orientation shortcut. Loader speed measured on honolulu: 454 ms per galaxy on a first read from shared storage, 27 ms
+from memory, 175 galaxies/s with 8 workers, hence the copy to local disk.
+
+Ablation settings for Phase C, all off by default:
+
+| Setting | Effect |
+|---|---|
+| `points=1024` | points per cloud; validation needs frozen sets with that count (`finalize_pointclouds.py --budget 1024 --frozen-only`) |
+| `common_radii=[3,5,7.5]` | trains and validates only on galaxies usable at every listed sphere, so sphere sizes compare on the same galaxies |
+| `inputs=no_velocities` or `no_scalars` | the encoders see positions plus the physical values, or positions plus velocities |
+| `point_invariants=true` | adds each point's distance from the centre, speed, radial velocity and tangential speed, which rotation and mirroring leave unchanged (the distance only when velocities are dropped) |
+| `loss_pairs=stars_anchor` | trains only the three stars pairs; validation still covers all 12 directions |
+| `shared_encoder=true` | one PointNet for all modalities, each with its own first layer and projection head |
+| `patch_centres=radial` | patch centres picked in radially equalised positions, so they follow the density |
+
+**Scoring finished runs (Phase D).** The test set is scored once, after the final setup is fixed; validation is used
+for every choice before that.
+
+| Piece | Code |
+|---|---|
+| reload a run, embed a split in one pass for several models, retrieval scores as during training | `galaxyclip3d/evaluation.py` |
+| linear probes: ridge per property, strength chosen on validation; R² (AUC for central and quenched) | `galaxyclip3d/probes.py` |
+| retrieval scores of runs on val or test, mean and spread over seeds, `--rotation` to override | `tools/eval_clip.py` |
+| probes on each modality's embedding, next to hand-made statistics and the untrained network | `tools/probe_clip.py` |
+| the no-network baselines on the test set | `tools/clip_baselines.py --split test` |
+| thesis figures (PDF + PNG) and tables (LaTeX + Markdown) from the saved results, with bootstrap intervals over test galaxies | `tools/clip_report.py` → `outputs/clip/report/` |
+
+```bash
+V3=/cluster/projects/ska/illustris/tng50-1.pointclouds/v3
+PYTHONPATH=pylibs:. python -s tools/eval_clip.py --data $V3 --split test --runs outputs/clip/phase_c/c21_combined \
+    outputs/clip/phase_c/c22_combined_seed2 outputs/clip/phase_c/c28_combined_seed3 --save outputs/clip/phase_d/test_final.json
+PYTHONPATH=pylibs:. python -s tools/probe_clip.py --data $V3 --runs outputs/clip/phase_c/c21_combined \
+    --untrained outputs/clip/phase_c/c21_combined --statistics --eval-split val \
+    --cache outputs/clip/phase_d/embeddings --save outputs/clip/phase_d/probes_val.json
+PYTHONPATH=pylibs:. python -s tools/clip_report.py          # reads outputs/clip, writes outputs/clip/report
+```
+
+Probe features of the training galaxies come from one fixed draw per galaxy (`PointCloudDataset(..., draw_seed=...)`,
+seeded by draw seed, snapshot and subhalo); validation and test galaxies use their frozen clouds. Property floors from
+`build_targets.py` (no gas, no black hole, no star formation) are left out of the fits; "quenched" (no star formation)
+is probed as a yes/no property instead.
+
 ## Code shared with GalaxyCLIP-2D
 
 Copied from GalaxyCLIP-2D commit `12d8db8` (modality-agnostic, unchanged unless noted):
