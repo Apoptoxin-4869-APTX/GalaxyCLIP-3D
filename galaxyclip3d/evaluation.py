@@ -43,12 +43,16 @@ def untrained_model(cfg: TrainConfig) -> torch.nn.Module:
 
 
 def run_dataset(cfg: TrainConfig, split: str, rotation: str | None = None, draw_seed: int | None = None,
-                standardized: bool = True) -> PointCloudDataset:
-    """The run's data settings (as train_clip.build_datasets) on any split; val and test use their frozen clouds."""
+                standardized: bool = True, modalities=None) -> PointCloudDataset:
+    """The run's data settings (as train_clip.build_datasets) on any split; val and test use their frozen clouds (with
+    dm_aperture="vmax", draws seeded by the dataset seed). `modalities` draws fewer modalities than the run has (e.g.
+    a four-modality run scored without HI); the model then embeds only those."""
     return PointCloudDataset(cfg.data, split, radius=cfg.radius, snapshots=cfg.snapshots,
                              gas_required=cfg.gas_required, rotation=rotation or cfg.rotation, mirror=cfg.mirror,
                              standardized=standardized, budget=cfg.points or None, common_radii=cfg.common_radii,
-                             draw_seed=draw_seed)
+                             draw_seed=draw_seed, dm_aperture=cfg.dm_aperture, rvmax_subset=cfg.rvmax_subset,
+                             min_particles=cfg.min_particles or None,
+                             modalities=cfg.modalities if modalities is None else modalities)
 
 
 def spread(n: int, limit: int) -> list[int]:
@@ -64,27 +68,27 @@ def embed(models: dict, dataset, device: str = "cpu", batch_size: int = 64, work
 
     Returns {name: {modality: float32 array (n, D)}} for each model, the per-galaxy ITEM_KEYS the items carry, and,
     with `per_cloud` (a function of one cloud array (N, F) -> 1-d array), {"per_cloud": {modality: (n, k)}}.
-    `limit` keeps that many galaxies spread over the split (quick checks)."""
+    Modalities are those the dataset returns and each model has. `limit` keeps that many galaxies spread over the
+    split (quick checks)."""
     dev = torch.device(device)
     for model in models.values():
         model.to(dev).eval()
     data = dataset if limit is None else torch.utils.data.Subset(dataset, spread(len(dataset), limit))
     loader = torch.utils.data.DataLoader(data, batch_size, shuffle=False, num_workers=workers)
-    embs = {name: {m: [] for m in MODALITIES} for name in models}
+    embs: dict[str, dict[str, list]] = {name: {} for name in models}
     extra: dict[str, list] = {}
-    stats = {m: [] for m in MODALITIES}
+    stats: dict[str, list] = {}
     for batch in loader:
-        clouds = {m: batch[m].to(dev) for m in MODALITIES}
+        clouds = {m: batch[m].to(dev) for m in MODALITIES if m in batch}
         for name, model in models.items():
-            out = model(clouds)
-            for m in MODALITIES:
-                embs[name][m].append(out[m].float().cpu())
+            for m, v in model(clouds).items():
+                embs[name].setdefault(m, []).append(v.float().cpu())
         for k in ITEM_KEYS:
             if k in batch:
                 extra.setdefault(k, []).append(torch.as_tensor(batch[k]))
         if per_cloud is not None:
-            for m in MODALITIES:
-                stats[m].extend(per_cloud(c) for c in batch[m].numpy())
+            for m in clouds:
+                stats.setdefault(m, []).extend(per_cloud(c) for c in batch[m].numpy())
     res = {name: {m: torch.cat(v).numpy() for m, v in e.items()} for name, e in embs.items()}
     res.update({k: torch.cat(v).numpy() for k, v in extra.items()})
     if per_cloud is not None:
@@ -94,14 +98,15 @@ def embed(models: dict, dataset, device: str = "cpu", batch_size: int = 64, work
 
 def retrieval_scores(emb: dict, mask, mstar=None, ks=(1, 5, 10), mass_bin_dex: float = 0.5) -> dict[str, float]:
     """Full-gallery recall per modality pair (masked_recall) plus recall among galaxies of similar stellar mass, as
-    train_clip.evaluate computes them during training."""
-    e = {m: torch.as_tensor(np.asarray(v)) for m, v in emb.items() if m in MODALITIES}
-    mk = torch.as_tensor(np.asarray(mask))
-    res = masked_recall(e, mk, tuple(ks))
+    train_clip.evaluate computes them during training, over the modalities in `emb` (`mask` has all four columns)."""
+    mods = tuple(m for m in MODALITIES if m in emb)
+    e = {m: torch.as_tensor(np.asarray(emb[m])) for m in mods}
+    mk = torch.as_tensor(np.asarray(mask))[:, [MODALITIES.index(m) for m in mods]]
+    res = masked_recall(e, mk, tuple(ks), modalities=mods)
     if mstar is not None and mass_bin_dex > 0:
         logm = torch.log10(torch.as_tensor(np.asarray(mstar)).double().clamp_min(1.0))
         bins = torch.floor(logm / mass_bin_dex).long()
-        res.update({f"massbin_{k}": v for k, v in masked_recall(e, mk, (1,), groups=bins).items()
+        res.update({f"massbin_{k}": v for k, v in masked_recall(e, mk, (1,), groups=bins, modalities=mods).items()
                     if k.startswith(("r1/", "chance/mean"))})
     res["galaxies"] = int(len(mk))
     return res

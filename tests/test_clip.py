@@ -49,8 +49,12 @@ assert all(np.array_equal(again[m], turned[m]) for m in MODALITIES), "seeded ori
 dets = [np.linalg.det(np.linalg.lstsq(clouds["stars"][:, :3], orient(clouds, np.random.default_rng(s))["stars"][:, :3],
                                       rcond=None)[0]) for s in range(40)]
 assert min(dets) < -0.99 and max(dets) > 0.99, "mirror gives reflections half of the time"
+part = orient({m: clouds[m] for m in ("dm", "hi")}, np.random.default_rng(1), "independent", mirror=True)
+assert set(part) == {"dm", "hi"} and all(np.array_equal(part[m], turned[m]) for m in part), \
+    "a modality gets the same matrix with or without the others (frozen clouds turn alike in every run)"
 print("PASS orientation: lengths and r.v kept, scalars untouched, one matrix per modality (or one shared), "
-      "reproducible with a seed, reflections with mirror, empty clouds stay empty")
+      "reproducible with a seed, reflections with mirror, empty clouds stay empty, a modality turns the same "
+      "whichever others are there")
 
 # ---------------------------------------------------------------- masked loss
 B, D = 12, 16
@@ -113,7 +117,11 @@ print("PASS masked recall: perfect embeddings 100%, random near chance, ties cou
 
 # ---------------------------------------------------------------- encoders
 for kind, extra in (("pointnet", {}), ("patch", {}), ("patch", {"patch_centres": "radial"}),
-                    ("pointnet", {"point_invariants": True}), ("patch", {"point_invariants": True})):
+                    ("pointnet", {"point_invariants": True}), ("patch", {"point_invariants": True}),
+                    ("pointnet2", {"sa_centres": (16, 4), "sa_neighbours": (8, 4), "sa_widths": ((16, 16), (16, 32))}),
+                    ("pointnet2", {"sa_centres": (16, 4), "sa_neighbours": (8, 4), "sa_widths": ((16, 16), (16, 32)), "sa_sampling": "fps", "point_invariants": True}),
+                    ("pointnext", {"nx_width": 8, "nx_centres": (32, 16, 8, 4), "nx_neighbours": (8, 8, 4, 4), "nx_widths": (16, 16, 32, 32), "nx_blocks": (1, 2, 0, 1)}),
+                    ("pointnext", {"nx_width": 8, "nx_centres": (32, 16, 8, 4), "nx_neighbours": (8, 8, 4, 4), "nx_widths": (16, 16, 32, 32), "nx_blocks": (1, 2, 0, 1), "sa_sampling": "fps", "point_invariants": True})):
     model = MultiModalCLIP(DIMS, kind, embed_dim=64, encoder_dim=64, width=64, depth=2, heads=4, patches=16,
                            patch_size=8, pointnet_widths=(16, 32), **extra)
     xb = {m: torch.randn(3, 128, d) for m, d in DIMS.items()}
@@ -126,9 +134,44 @@ for kind, extra in (("pointnet", {}), ("patch", {}), ("patch", {"patch_centres":
     assert torch.isfinite(out["gas"]).all(), "an all-zero (masked) cloud must not give NaN"
 idx = farthest_point_sample(torch.randn(2, 100, 3), 10)
 assert idx.shape == (2, 10) and all(len(set(i.tolist())) == 10 for i in idx)
+from galaxyclip3d.models.encoders import PointNet2Encoder                             # noqa: E402
+pn2 = PointNet2Encoder(DIMS["gas"], 32, centres=(16, 4), neighbours=(8, 4), widths=((16,), (16, 32)), global_widths=(32,))
+assert pn2(torch.randn(2, 64, DIMS["gas"])).shape == (2, 32)
+assert pn2(torch.randn(2, 6, DIMS["gas"])).shape == (2, 32), "fewer points than centres or neighbours still works"
+assert pn2.levels[0][0].in_features == 3 + 2 * DIMS["gas"] and pn2.levels[1][0].in_features == 3 + 2 * (2 * 16 + 4)
+for bad in (dict(sampling="random"), dict(centres=(16, 32)), dict(centres=(16,)), dict(neighbours=(0, 4))):
+    try:
+        PointNet2Encoder(8, 32, **{"centres": (16, 4), "neighbours": (8, 4), "widths": ((16,), (16,)), **bad})
+        raise AssertionError(f"{bad} should be refused")
+    except ValueError:
+        pass
+from galaxyclip3d.models.encoders import InvResMLP, PointNeXtEncoder, SetAbstraction  # noqa: E402
+nx = PointNeXtEncoder(DIMS["gas"], 32, width=8, centres=(32, 16, 8), neighbours=(8, 8, 4), widths=(16, 16, 32),
+                      blocks=(1, 0, 2))
+assert nx(torch.randn(2, 64, DIMS["gas"])).shape == (2, 32) and nx(torch.randn(2, 5, DIMS["gas"])).shape == (2, 32)
+kinds = [[type(b).__name__ for b in st] for st in nx.stages]
+assert kinds == [["SetAbstraction", "InvResMLP"], ["SetAbstraction"], ["SetAbstraction", "InvResMLP", "InvResMLP"]]
+assert isinstance(nx.stages[0][0].mlp, torch.nn.Linear) and isinstance(nx.stages[1][0].mlp, torch.nn.Sequential), \
+    "one layer per point in a set abstraction followed by blocks, two without (as in PointNeXt)"
+assert nx.stages[2][1].pointwise[0].out_features == 4 * 32, "blocks widen 4x"
+blk, xyz0, f0 = InvResMLP(16, 4), torch.randn(2, 10, 3), torch.randn(2, 10, 16)
+torch.nn.init.zeros_(blk.pointwise[3].weight), torch.nn.init.zeros_(blk.pointwise[3].bias)
+torch.nn.init.zeros_(blk.pointwise[4].weight), torch.nn.init.zeros_(blk.pointwise[4].bias)
+assert torch.allclose(blk(xyz0, f0), torch.nn.functional.gelu(f0)), "a block whose last layer is zero passes its input on"
+for bad in (dict(sampling="random"), dict(centres=(16, 32, 8)), dict(blocks=(1, 1)), dict(blocks=(1, -1, 1)),
+            dict(expansion=0)):
+    try:
+        PointNeXtEncoder(8, 32, **{"width": 8, "centres": (16, 8, 4), "neighbours": (4, 4, 4), "widths": (8, 8, 8),
+                                   "blocks": (1, 1, 1), **bad})
+        raise AssertionError(f"{bad} should be refused")
+    except ValueError:
+        pass
 lt = MultiModalCLIP(DIMS, "pointnet", embed_dim=8, encoder_dim=8, learn_temperature=True, pointnet_widths=(8,))
 assert isinstance(lt.logit_scale, torch.nn.Parameter) and abs(float(lt.temperature().detach()) - 0.07) < 1e-6
-print("PASS encoders: shapes, unit-length embeddings, same output for shuffled points, masked clouds finite, "
+print("PASS encoders (PointNet, patch transformer, PointNet++, PointNeXt): shapes, unit-length embeddings, same "
+      "output for shuffled points, masked clouds finite, PointNet++ levels sized as designed and bad levels refused, "
+      "PointNeXt stages as designed (one or two layers per set abstraction, blocks widened 4x and residual), bad "
+      "stages refused, "
       "farthest-point sampling picks distinct points, learnable temperature")
 
 # ---------------------------------------------------------------- ablation options of the model
@@ -251,11 +294,37 @@ train_clip.main(["--set", *common, "epochs=1", "inputs=\"no_velocities\"", "loss
 ab = json.loads((tmp / "ablation" / "history.json").read_text())
 assert set(ab["pair_loss"][0]) == {"stars-dm", "stars-gas", "stars-hi"}, "the anchor trains only the stars pairs"
 assert "r1/dm->gas" in ab["val"][-1] and len(ab["val"]) == 2, "validation keeps every direction"
+train_clip.main(["--set", *common, "epochs=1", 'encoder="pointnet2"', "sa_centres=[16,4]", "sa_neighbours=[8,4]",
+                 "sa_widths=[[16,16],[16,32]]", f"out_dir=\"{tmp / 'pn2'}\""])
+pn = json.loads((tmp / "pn2" / "history.json").read_text())
+assert len(pn["val"]) == 2 and all(np.isfinite(pn["train_loss"])), "a PointNet++ run trains and validates"
+pn_cfg = train_clip.TrainConfig(**json.loads((tmp / "pn2" / "config.json").read_text()))
+pn_model = train_clip.build_model(pn_cfg)
+pn_model.load_state_dict(load_checkpoint(tmp / "pn2" / "best.pt")["model_state_dict"])
+assert type(pn_model.encoders["stars"]).__name__ == "PointNet2Encoder" and len(pn_model.encoders["stars"].levels) == 2
+train_clip.main(["--set", *common, "epochs=1", 'encoder="pointnext"', "nx_width=8", "nx_centres=[32,16,8,4]",
+                 "nx_neighbours=[8,8,4,4]", "nx_widths=[16,16,32,32]", "nx_blocks=[1,1,0,1]",
+                 f"out_dir=\"{tmp / 'pnx'}\""])
+px = json.loads((tmp / "pnx" / "history.json").read_text())
+assert len(px["val"]) == 2 and all(np.isfinite(px["train_loss"])), "a PointNeXt run trains and validates"
+px_cfg = train_clip.TrainConfig(**json.loads((tmp / "pnx" / "config.json").read_text()))
+px_model = train_clip.build_model(px_cfg)
+px_model.load_state_dict(load_checkpoint(tmp / "pnx" / "best.pt")["model_state_dict"])
+assert type(px_model.encoders["gas"]).__name__ == "PointNeXtEncoder" and len(px_model.encoders["gas"].stages) == 4
+for bad in (['encoder="pointnet3"'], ['sa_sampling="random"'], ['encoder="pointnet2"', "sa_centres=[16,32]"],
+            ['encoder="pointnet2"', "sa_neighbours=[8]"], ['encoder="pointnext"', "nx_blocks=[1,1]"],
+            ['encoder="pointnext"', "nx_centres=[8,16,4,2]"], ['encoder="pointnext"', "nx_expansion=0"]):
+    try:
+        train_clip.TrainConfig.from_file(None, bad)
+        raise AssertionError(f"{bad} should be refused")
+    except SystemExit:
+        pass
 ab_cfg = train_clip.TrainConfig(**json.loads((tmp / "ablation" / "config.json").read_text()))
 rebuilt = train_clip.build_model(ab_cfg)
 rebuilt.load_state_dict(load_checkpoint(tmp / "ablation" / "best.pt")["model_state_dict"])
 assert ab_cfg.point_invariants and rebuilt.encoders["dm"][0][0].in_features == 3 + 1, "DM: positions + distance"
-for bad in ('inputs="no_positions"', 'loss_pairs="dm_anchor"', 'patch_centres="random"', "shared_encoder=true"):
+for bad in ('inputs="no_positions"', 'loss_pairs="dm_anchor"', 'patch_centres="random"', "shared_encoder=true",
+            'dm_aperture="r200c"'):
     try:
         train_clip.TrainConfig.from_file(None, [bad])
         raise AssertionError(f"{bad} should be refused")
@@ -264,7 +333,8 @@ for bad in ('inputs="no_positions"', 'loss_pairs="dm_anchor"', 'patch_centres="r
 print(f"PASS training run: loss {hist['train_loss'][0]:.2f} -> {hist['train_loss'][-1]:.2f}, val R@1 "
       f"{hist['val'][0]['r1/mean']:.0%} -> {hist['val'][-1]['r1/mean']:.0%} (chance {hist['val'][0]['chance/mean']:.0%})"
       "; resume continues the history; the shuffle control runs; a run without velocities, with a stars anchor, a "
-      "shared encoder, EMA and point invariants runs and its checkpoint reloads; unknown option values are refused")
+      "shared encoder, EMA and point invariants runs and its checkpoint reloads; PointNet++ and PointNeXt runs train "
+      "and their checkpoints reload; unknown option values and bad PointNet++ levels or PointNeXt stages are refused")
 
 # ---------------------------------------------------------------- scoring finished runs, linear probes (Phase D)
 import h5py                                                                            # noqa: E402
@@ -316,5 +386,58 @@ print("PASS Phase D helpers: a reloaded run scores exactly as the trainer's eval
       "and per-cloud statistics, the untrained model is seeded; ridge probes recover a linear signal (R^2 "
       f"{fit['test']:.3f}), not noise ({noise['test']:.3f}), and a class (AUC {cls['test']:.3f}); AUC, R^2, targets "
       "and lookup by subhalo behave")
+# ---------------------------------------------------------------- Stage E: fewer modalities (no HI)
+class Without(torch.utils.data.Dataset):
+    """A dataset whose items lack one modality, as PointCloudDataset(modalities=...) returns them."""
+
+    def __init__(self, ds, drop):
+        self.ds, self.drop = ds, drop
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        item = {k: v for k, v in self.ds[i].items() if k != self.drop}
+        item["mask"] = item["mask"].clone()
+        item["mask"][MODALITIES.index(self.drop)] = False
+        return item
+
+
+train_clip.build_datasets = lambda cfg: (Without(Synthetic(96, 1, False), "hi"), Without(Synthetic(40, 2, True), "hi"))
+train_clip.main(["--set", *common, "epochs=2", 'modalities=["gas","stars","dm"]', f"out_dir=\"{tmp / 'stage_e'}\""])
+se = json.loads((tmp / "stage_e" / "history.json").read_text())
+assert set(se["pair_loss"][0]) == {"stars-dm", "stars-gas", "dm-gas"}, "only the pairs of the kept modalities"
+directions = {k.split("/", 1)[1] for k in se["val"][-1] if "->" in k}
+assert directions == {f"{a}->{b}" for a in ("stars", "dm", "gas") for b in ("stars", "dm", "gas") if a != b}, \
+    "only the 6 directions of stars, dark matter and gas are scored"
+assert se["val"][-1]["r1/mean_no_gas_hi"] == se["val"][-1]["r1/mean"], "without HI both means are the same"
+se_cfg, se_model, _ = load_run(tmp / "stage_e")
+assert se_cfg.modalities == ["stars", "dm", "gas"], "kept in the order of MODALITIES"
+assert set(se_model.encoders) == {"stars", "dm", "gas"}, "one encoder per kept modality; the checkpoint reloads"
+val3 = Without(Synthetic(40, 2, True), "hi")
+ref3 = train_clip.evaluate(se_model, torch.utils.data.DataLoader(val3, 16), torch.device("cpu"), se_cfg, None)
+got3 = embed({"e": se_model}, val3, batch_size=16, workers=0)
+res3 = retrieval_scores(got3["e"], got3["mask"], got3["mstar"], ks=tuple(se_cfg.ks), mass_bin_dex=se_cfg.mass_bin_dex)
+assert set(got3["e"]) == {"stars", "dm", "gas"} and set(ref3) == set(res3)
+assert all(abs(res3[k] - ref3[k]) < 1e-6 for k in ref3), "scoring helpers match the trainer without HI too"
+old = embed({"run": model_run}, val3, batch_size=16, workers=0)                     # a four-modality run without HI
+r_old = retrieval_scores(old["run"], old["mask"], old["mstar"])
+r_all = retrieval_scores(got["run"], got["mask"], got["mstar"])
+kept = [k for k in r_all if k.startswith("r1/") and "->" in k and "hi" not in k]
+assert set(old["run"]) == {"stars", "dm", "gas"} and all(r_old[k] == r_all[k] for k in kept), \
+    "a four-modality run scored without HI keeps its numbers for the other directions"
+assert abs(r_old["r1/mean"] - np.mean([r_all[k] for k in kept])) < 1e-9, "its mean is over the 6 directions"
+for bad in (['modalities=["stars"]'], ['modalities=["stars","xray"]'], ['modalities=["dm","dm"]'],
+            ["min_particles=-1"], ["points=4096", "min_particles=2048"],
+            ['modalities=["dm","gas"]', 'loss_pairs="stars_anchor"']):
+    try:
+        train_clip.TrainConfig.from_file(None, bad)
+        raise AssertionError(f"{bad} should be refused")
+    except SystemExit:
+        pass
+print("PASS Stage E: a run without HI trains and scores only stars, dark matter and gas (3 pair losses, 6 "
+      "directions), reloads with three encoders and scores the same with the Phase D helpers; a four-modality run "
+      "scored without HI keeps its numbers for the other directions; too few, unknown or repeated modalities, a "
+      "threshold below the points and a stars anchor without stars are refused")
 shutil.rmtree(tmp, ignore_errors=True)
 print("ALL TESTS PASSED")

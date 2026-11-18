@@ -1,0 +1,17 @@
+{
+  "run_name": "stage_e_pointnet2",
+  "wandb": true,
+  "out_dir": "outputs/clip/stage_e/run_pointnet2",
+  "encoder": "pointnet2",
+  "pointnet_widths": [128, 256, 512, 1024],
+  "sa_centres": [512, 128],
+  "sa_neighbours": [32, 32],
+  "sa_widths": [[64, 64, 128], [128, 128, 256]],
+  "sa_sampling": "radial",
+  "learn_temperature": true,
+  "epochs": 600,
+  "lr": 1e-3,
+  "points": 4096,
+  "min_particles": 8192,
+  "modalities": ["stars", "dm", "gas"]
+}

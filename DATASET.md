@@ -30,7 +30,7 @@ described in **`SELECTION.md`**.
 | `snap_099/index.h5` | snapshot 99's part of `index.h5` |
 | `snap_099/frozen/val_r5.h5`, `test_r5.h5` | fixed validation and test clouds (520 and 499 galaxies) |
 | `snap_099/qa_clouds.pdf`, `qa.log` | quality checks and example clouds |
-| `snap_099/targets.h5` | physical properties per galaxy for testing embeddings: halo mass, bound masses, SFR, metallicities, colour, mean stellar age, HI mass in the sphere (`tools/build_targets.py`) |
+| `snap_099/targets.h5` | physical properties per galaxy for testing embeddings: halo mass, bound masses, SFR, metallicities, colour, mean stellar age, HI mass in the sphere; R_vmax and the dark-matter particles inside it, for `PointCloudDataset(..., dm_aperture="vmax")` (`tools/build_targets.py`) |
 
 A snapshot added later gets its own `snap_NNN/` folder with the same files.
 
@@ -136,6 +136,11 @@ half-mass radii (`n_<type>_r<k>`), `hi_eff_r<k>`, and stored counts. A galaxy is
   there for controls.
 - Training draws are fresh every time; validation and test clouds come from each snapshot's `frozen/`.
 - A masked modality is returned as zeros, with `mask` = [stars, dm, gas, hi] telling which are present.
+- `PointCloudDataset(..., min_particles=8192)` keeps only galaxies with at least that many star and dark-matter
+  particles inside the sphere; the gas modality then needs as many gas cells. Only values above the dataset's 4,096
+  work, and validation and test galaxies keep their frozen clouds. `modalities=["stars", "dm", "gas"]` draws and
+  returns only those clouds; the mask keeps four columns, with the left-out ones False. Stage E uses both
+  (`configs/clip_stage_e.json`).
 - `MassBalancedSampler` draws training galaxies evenly across six stellar-mass bins.
 - Every item carries `snapshot`, `redshift`, `group` (= the 2D `gid` at that snapshot), `subhalo`, `central`,
   `halo_has_2d` and `z0_subhalo`, for pairing with the 2D maps or across snapshots; 2D↔3D experiments need one split
@@ -191,8 +196,8 @@ python tools/check_pointclouds.py --out /cluster/projects/ska/illustris/tng50-1.
   the `sf` feature marks it. `NeutralHydrogenAbundance` in star-forming gas includes molecular hydrogen.
 - Positions and velocities are scaled per galaxy, so absolute size and mass are not in the clouds; `rhalf_star_kpc`,
   `vmax`, `mstar` and `redshift` in the index can be added as galaxy-level inputs if needed.
-- Frozen sets exist for spheres of 3, 5 and 7.5 radii with 2,048 points, and for 5 radii with 1,024 points
-  (`<split>_r5_p1024.h5`, read by `PointCloudDataset(..., budget=1024)`). For another sphere or point count run
+- Frozen sets exist for spheres of 3, 5 and 7.5 radii with 2,048 points, and for 5 radii with 1,024 and 4,096 points
+  (`<split>_r5_p1024.h5` and `<split>_r5_p4096.h5`, read by `PointCloudDataset(..., budget=1024)` or `budget=4096`). For another sphere or point count run
   `tools/finalize_pointclouds.py --out DIR --snap S --radius R [--budget N] --frozen-only` (radii available: 2, 3, 5,
   7.5, 10); `--frozen-only` leaves the indexes, feature statistics and `snapshots.json` alone.
 - Frozen clouds are seeded by (4869, subhalo, 1), as in v2; the subhalo number repeats across snapshots, which only

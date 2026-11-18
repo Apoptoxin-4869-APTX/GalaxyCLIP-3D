@@ -1,0 +1,19 @@
+{
+  "run_name": "stage_e_pointnext",
+  "wandb": true,
+  "out_dir": "outputs/clip/stage_e/run_pointnext",
+  "encoder": "pointnext",
+  "nx_width": 32,
+  "nx_centres": [1024, 512, 256, 128],
+  "nx_neighbours": [32, 32, 32, 32],
+  "nx_widths": [64, 128, 256, 256],
+  "nx_blocks": [1, 2, 1, 1],
+  "nx_expansion": 4,
+  "sa_sampling": "radial",
+  "learn_temperature": true,
+  "epochs": 600,
+  "lr": 1e-3,
+  "points": 4096,
+  "min_particles": 8192,
+  "modalities": ["stars", "dm", "gas"]
+}

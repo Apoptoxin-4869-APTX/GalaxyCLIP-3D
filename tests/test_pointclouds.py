@@ -483,10 +483,104 @@ else:
         "a draw seed fixes each training galaxy's draw and orientation"
     assert not np.array_equal(s7a[0]["stars"].numpy(), s8[0]["stars"].numpy()), "another seed draws otherwise"
     assert not np.array_equal(ds[0]["stars"].numpy(), ds[0]["stars"].numpy()), "without a seed every call draws anew"
+
+    # dark matter in a sphere of its own (dm_aperture="vmax"): R_vmax and the particle count come from targets.h5
+    from galaxyclip3d.dataset import dm_vmax_radius
+    from galaxyclip3d.pointclouds.layout import snapshot_dir, write_table
+    try:
+        PointCloudDataset(out, "train", radius=R, dm_aperture="vmax")
+        raise AssertionError("without r_vmax_kpc in targets.h5 the vmax sphere must be refused")
+    except FileNotFoundError:
+        pass
+    r_dm = 0.3 * R * every["rhalf_star_kpc"]                      # inside the stored 10 radii, a third of the sphere
+    n_dm = np.full(len(r_dm), 1e9)
+    beyond, sparse = 0, 1                                         # rows: one sphere too large, one with too few particles
+    r_dm[beyond] = 1.5 * cfg.extract_radius * every["rhalf_star_kpc"][beyond]
+    n_dm[sparse] = cfg.min_particles - 1
+    for sn in (91, 99):
+        rows = np.flatnonzero(every["snapshot"] == sn)
+        write_table(snapshot_dir(out, sn) / "targets.h5", {"subhalo": every["subhalo"][rows], "r_vmax_kpc": r_dm[rows],
+                                                           "n_dm_rvmax": n_dm[rows]}, {"snapshot": sn})
+    want = np.arange(len(r_dm)) >= 2
+    assert np.array_equal(np.isfinite(dm_vmax_radius(out, every, cfg)), want), "too large or too sparse: left out"
+    # unrotated, so the stars (drawn first) match exactly; later draws and orientations use the random stream after
+    # the dark matter, which differs with its sphere
+    star_sphere = PointCloudDataset(out, "train", radius=R, draw_seed=3, rotation="none")
+    dmv = PointCloudDataset(out, "train", radius=R, draw_seed=3, rotation="none", dm_aperture="vmax")
+    assert np.array_equal(dmv.rows, np.intersect1d(star_sphere.rows, np.flatnonzero(want)))
+    for i in range(len(dmv)):
+        a, b = dmv[i], star_sphere[int(np.flatnonzero(star_sphere.rows == dmv.rows[i])[0])]
+        rdm = np.linalg.norm(a["dm"][:, :3].numpy(), axis=1)
+        assert rdm.max() <= 1 + 1e-5 and rdm.max() > 0.6, "dark matter cut at and scaled by its own sphere"
+        assert np.linalg.norm(b["dm"][:, :3].numpy(), axis=1).max() <= 1 + 1e-5
+        assert np.array_equal(a["stars"].numpy(), b["stars"].numpy()), "stars keep the stellar sphere and the draw"
+    vv = [PointCloudDataset(out, "val", radius=R, dm_aperture="vmax") for _ in range(2)]
+    assert not vv[0].frozen and vv[0].draw_seed == cfg.seed and len(vv[0]) > 0
+    assert all(np.array_equal(vv[0][i][m].numpy(), vv[1][i][m].numpy()) for i in range(len(vv[0]))
+               for m in MODALITIES), "validation clouds with the vmax sphere are seeded, the same every time"
+    try:
+        PointCloudDataset(out, "val", radius=R, dm_aperture="vmax", frozen=True)
+        raise AssertionError("frozen (stellar-sphere) clouds must be refused with the vmax sphere")
+    except ValueError:
+        pass
+    # the same galaxies with the stellar sphere (rvmax_subset, the matched control): clouds as without it
+    sub = PointCloudDataset(out, "train", radius=R, draw_seed=3, rotation="none", rvmax_subset=True)
+    assert np.array_equal(sub.rows, dmv.rows), "the galaxies of the vmax sphere"
+    for i in range(len(sub)):
+        b = star_sphere[int(np.flatnonzero(star_sphere.rows == sub.rows[i])[0])]
+        assert all(np.array_equal(sub[i][m].numpy(), b[m].numpy()) for m in MODALITIES), "stellar-sphere clouds"
+    sv, full = PointCloudDataset(out, "val", radius=R, rvmax_subset=True), PointCloudDataset(out, "val", radius=R)
+    assert sv.frozen and len(sv) > 0 and np.array_equal(sv.rows, vv[0].rows), "frozen clouds, same galaxies"
+    for i in range(len(sv)):
+        b = full[int(np.flatnonzero(full.rows == sv.rows[i])[0])]
+        assert all(np.array_equal(sv[i][m].numpy(), b[m].numpy()) for m in MODALITIES), "the frozen clouds"
+    for sn in (91, 99):
+        (snapshot_dir(out, sn) / "targets.h5").unlink()
+    # Stage E: a higher particle threshold (gas follows it), fewer modalities
+    lowest = np.minimum(every["n_stars_r10"], every["n_dm_r10"])
+    held_out = np.isin(every["split"], [1, 2])                    # galaxies with frozen clouds
+    thr = max(int(t) for t in lowest[held_out] if t > cfg.min_particles and (lowest < t).any())  # drops some, keeps one
+    u_thr = (every["n_stars_r10"] >= thr) & (every["n_dm_r10"] >= thr)
+    for split, code in (("train", 0), ("val", 1), ("test", 2)):
+        d_thr = PointCloudDataset(out, split, radius=R, min_particles=thr)
+        assert np.array_equal(d_thr.rows, np.flatnonzero(u_thr & (every["split"] == code))), split
+        assert np.array_equal(d_thr.mask[:, 2], every["n_gas_r10"] >= thr), "the gas modality needs as many cells"
+    fs = {1: "val", 2: "test"}[int(every["split"][np.flatnonzero(held_out & u_thr)[0]])]
+    f_thr, f_all = PointCloudDataset(out, fs, radius=R, min_particles=thr), PointCloudDataset(out, fs, radius=R)
+    assert f_thr.frozen and 0 < len(f_thr) <= len(f_all) and len(f_thr) < len(lowest)
+    for i in range(len(f_thr)):
+        b = f_all[int(np.flatnonzero(f_all.rows == f_thr.rows[i])[0])]
+        assert all(np.array_equal(f_thr[i][m].numpy(), b[m].numpy()) for m in MODALITIES), "the same frozen clouds"
+    full = PointCloudDataset(out, "val", radius=R)
+    three = PointCloudDataset(out, "val", radius=R, modalities=["gas", "stars", "dm"])
+    assert three.modalities == ("stars", "dm", "gas") and not three.mask[:, 3].any()
+    for i in range(len(three)):
+        a, b = three[i], full[i]
+        assert "hi" not in a and not a["mask"][3] and np.array_equal(a["mask"][:3].numpy(), b["mask"][:3].numpy())
+        assert all(np.array_equal(a[m].numpy(), b[m].numpy()) for m in three.modalities), \
+            "frozen clouds and their rotations as with all four modalities"
+    s3, s4 = (PointCloudDataset(out, "train", radius=R, draw_seed=7, rotation="none", modalities=mods)
+              for mods in (["stars", "dm", "gas"], None))
+    assert all(np.array_equal(s3[i][m].numpy(), s4[i][m].numpy()) for i in range(3) for m in ("stars", "dm", "gas")), \
+        "seeded draws of the kept modalities as with all four (HI is drawn last)"
+    assert set(s3[0]) & set(MODALITIES) == {"stars", "dm", "gas"}
+    for bad in (dict(min_particles=cfg.min_particles - 1), dict(modalities=[]), dict(modalities=["stars", "xray"]),
+                dict(modalities=["dm", "dm"]), dict(modalities=["stars", "dm"], gas_required=True),
+                dict(budget=cfg.min_particles + 1)):
+        try:
+            PointCloudDataset(out, "train", radius=R, **bad)
+            raise AssertionError(f"{bad} should be refused")
+        except ValueError:
+            pass
     print("PASS loader: both snapshots or one, snapshot in every item, shapes, masks, mass-balanced sampler, frozen "
           "validation clouds per snapshot; another point count with its own frozen sets (--frozen-only touches "
           "nothing else, a count without them is refused); galaxies usable at several spheres; a draw seed makes "
-          "training draws reproducible")
+          "training draws reproducible; dark matter in a sphere of its own (R_vmax): galaxies outside the stored "
+          "particles or with too few are left out, the other clouds are unchanged, validation clouds are seeded; the "
+          "same galaxies with the stellar sphere keep their clouds, frozen ones for validation; a higher particle "
+          "threshold keeps the galaxies above it (the gas modality too) with their frozen clouds, a lower one is "
+          "refused; fewer modalities return only those, with the frozen clouds, rotations and seeded draws they "
+          "have with all four")
 
 if os.environ.get("KEEP_TMP"):                    # KEEP_TMP=1 keeps the synthetic data and datasets to look at
     print("kept", TMP)

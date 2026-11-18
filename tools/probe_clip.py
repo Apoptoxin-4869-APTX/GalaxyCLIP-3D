@@ -32,8 +32,10 @@ from galaxyclip3d.evaluation import ITEM_KEYS, embed, load_run, run_dataset, unt
 from galaxyclip3d.multimodal import MODALITIES                                           # noqa: E402
 from galaxyclip3d.pointclouds.config import Config                                       # noqa: E402
 from galaxyclip3d.probes import PROPERTIES, load_targets, lookup, ridge_probe            # noqa: E402
+from galaxyclip3d.train_clip import TrainConfig                                          # noqa: E402
 
-DATA_KEYS = ("radius", "points", "common_radii", "snapshots", "gas_required")
+DATA_KEYS = ("radius", "points", "common_radii", "snapshots", "gas_required", "dm_aperture", "rvmax_subset",
+             "min_particles", "modalities")
 
 
 def cache_path(cache: Path, name: str, split: str, limit) -> Path:
@@ -42,7 +44,7 @@ def cache_path(cache: Path, name: str, split: str, limit) -> Path:
 
 def save_features(path: Path, feats: dict, items: dict, meta: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, meta=json.dumps(meta), **{f"emb_{m}": feats[m] for m in MODALITIES}, **items)
+    np.savez(path, meta=json.dumps(meta), **{f"emb_{m}": v for m, v in feats.items()}, **items)
 
 
 def load_features(path: Path, meta: dict):
@@ -52,14 +54,16 @@ def load_features(path: Path, meta: dict):
     with np.load(path) as z:
         if json.loads(str(z["meta"])) != meta:
             return None
-        return {m: z[f"emb_{m}"] for m in MODALITIES}, {k: z[k] for k in ITEM_KEYS if k in z}
+        return ({m: z[f"emb_{m}"] for m in MODALITIES if f"emb_{m}" in z},
+                {k: z[k] for k in ITEM_KEYS if k in z})
 
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--data", required=True, help="the dataset's folder")
     ap.add_argument("--runs", nargs="*", default=[], help="run folders (config.json + best.pt)")
-    ap.add_argument("--untrained", default=None, help="a run folder whose architecture is probed untrained")
+    ap.add_argument("--untrained", default=None,
+                    help="a run folder whose architecture is probed untrained (its config.json is enough)")
     ap.add_argument("--statistics", action="store_true", help="also probe the hand-made per-cloud statistics")
     ap.add_argument("--eval-split", choices=("val", "test"), default="val")
     ap.add_argument("--cache", type=Path, required=True)
@@ -77,8 +81,8 @@ def main(argv=None) -> None:
             raise SystemExit(f"run folder names must differ: {name}")
         cfgs[name], models[name], ck = load_run(run, data=args.data)
         metas[name] = {"run": str(Path(run).resolve()), "epoch": ck.get("epoch")}
-    if args.untrained:
-        cfg, _, _ = load_run(args.untrained, data=args.data)
+    if args.untrained:                                  # only the run's config.json is needed, no checkpoint
+        cfg = TrainConfig.from_file(str(Path(args.untrained) / "config.json"), [f"data={args.data}"])
         cfgs["untrained"], models["untrained"] = cfg, untrained_model(cfg)
         metas["untrained"] = {"run": str(Path(args.untrained).resolve()), "untrained_seed": cfg.seed}
     if not cfgs:
@@ -97,6 +101,16 @@ def main(argv=None) -> None:
     for split in splits:
         common = {"split": split, "draw_seed": seed if split == "train" else None, "limit": args.limit,
                   "rotation": "independent"}
+        if ref.dm_aperture != "stellar":                # (absent for the default, so older caches stay valid)
+            common["dm_aperture"] = ref.dm_aperture
+        if ref.rvmax_subset:
+            common["rvmax_subset"] = True
+        if ref.points:                                  # (each only when set, so older caches stay valid)
+            common["points"] = ref.points
+        if ref.min_particles:
+            common["min_particles"] = ref.min_particles
+        if ref.modalities != list(MODALITIES):
+            common["modalities"] = ref.modalities
         todo = {}
         for n in names:
             meta = {**common, **metas.get(n, {"statistics": True})}
@@ -127,10 +141,12 @@ def main(argv=None) -> None:
         if not np.all(it["snapshot"] == 99):
             raise SystemExit("probes need snapshot 99 targets; other snapshots are not supported yet")
     y = {split: lookup(targets, it["subhalo"]) for split, it in items.items()}
+    mods = [m for m in MODALITIES if all(m in feats[n][s] for n in names for s in splits)]
     results = {}
     for n in names:
         results[n] = {}
-        for mi, m in enumerate(MODALITIES):
+        for m in mods:
+            mi = MODALITIES.index(m)
             results[n][m] = {}
             for prop, (_, _, score) in PROPERTIES.items():
                 rows = {s: items[s]["mask"][:, mi] & np.isfinite(y[s][prop]) for s in splits}
@@ -146,15 +162,15 @@ def main(argv=None) -> None:
     yes_no = [p for p, (_, _, s) in PROPERTIES.items() if s == "auc"]
     print(f"\nmean R^2 over {len(regress)} properties on {ev}, negative values counted as 0 (in brackets: AUC of "
           + ", ".join(yes_no) + ")")
-    print(f"{'features':28s}" + "".join(f"{m:>22s}" for m in MODALITIES))
+    print(f"{'features':28s}" + "".join(f"{m:>22s}" for m in mods))
     for n in names:
         row = []
-        for m in MODALITIES:
+        for m in mods:
             v = [max(results[n][m][p][ev], 0.0) for p in regress if p in results[n][m]]
             c = "/".join(f"{results[n][m][p][ev]:.2f}" if p in results[n][m] else "-" for p in yes_no)
             row.append(f"{np.mean(v):6.3f} ({c})" if v else "-")
         print(f"{n:28s}" + "".join(f"{r:>22s}" for r in row))
-    for m in MODALITIES:
+    for m in mods:
         print(f"\n{m} embedding, R^2 on {ev} (" + ", ".join(yes_no) + ": AUC):")
         print(f"{'property':18s}" + "".join(f"{n[:14]:>15s}" for n in names))
         for p in PROPERTIES:

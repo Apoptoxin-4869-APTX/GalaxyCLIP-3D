@@ -1,0 +1,13 @@
+{
+  "run_name": "stage_e",
+  "wandb": true,
+  "out_dir": "outputs/clip/stage_e/run",
+  "encoder": "pointnet",
+  "pointnet_widths": [128, 256, 512, 1024],
+  "learn_temperature": true,
+  "epochs": 600,
+  "lr": 1e-3,
+  "points": 4096,
+  "min_particles": 8192,
+  "modalities": ["stars", "dm", "gas"]
+}

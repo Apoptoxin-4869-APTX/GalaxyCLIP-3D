@@ -10,6 +10,12 @@ validation galaxies. Before the first epoch the untrained model is evaluated too
 Writes into out_dir: latest.pt (everything needed to resume; a SIGUSR1 from SLURM saves it and exits with code 3),
 best.pt (weights at the best validation R@1, mean over pairs without gas-HI), history.json, config.json. Rerunning
 with the same out_dir resumes from latest.pt.
+
+`modalities` trains and scores only those modalities (one encoder each; e.g. Stage E leaves out HI, so its validation
+R@1 is the mean over the 6 directions of stars, dark matter and gas), and `min_particles` raises the particles a galaxy
+needs inside the sphere (dataset.py). configs/clip_stage_e.json holds the Stage E settings, and
+configs/clip_stage_e_pointnet2.json the same with PointNet++ encoders (encoder=pointnet2, sa_* settings) and
+configs/clip_stage_e_pointnext.json with PointNeXt encoders (encoder=pointnext, nx_* settings).
 """
 from __future__ import annotations
 
@@ -26,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .dataset import MassBalancedSampler, PointCloudDataset
+from .dataset import DM_APERTURES, MassBalancedSampler, PointCloudDataset
 from .models import MultiModalCLIP
 from .multimodal import MODALITIES, masked_all_pairs_loss, masked_recall, pairs, shuffle_partners
 from .pointclouds.sampling import FEATURES, INPUTS, input_columns
@@ -48,15 +54,30 @@ class TrainConfig:
     common_radii: list | None = None          # keep only galaxies usable (modalities on) at every one of these spheres
     inputs: str = "all"                       # all | no_velocities | no_scalars (columns the encoders see)
     point_invariants: bool = False            # also feed each point's distance, speed, radial and tangential velocity
+    dm_aperture: str = "stellar"              # stellar | vmax (dark matter cut at and scaled by R_vmax; a control)
+    rvmax_subset: bool = False                # only the galaxies dm_aperture=vmax keeps (its matched control)
+    min_particles: int = 0                    # stars, dark matter (and gas cells for the gas modality) a galaxy needs
+                                              # inside the sphere; 0 = the dataset's 4,096, only higher values work
+    modalities: list = field(default_factory=lambda: list(MODALITIES))   # trained and scored (at least two)
     # model
-    encoder: str = "patch"                   # patch | pointnet
+    encoder: str = "patch"                   # patch | pointnet | pointnet2 | pointnext
     width: int = 384
     depth: int = 6
     heads: int = 6
     patches: int = 128
     patch_size: int = 32
     patch_centres: str = "fps"                # fps | radial (centres picked in radially equalised positions)
-    pointnet_widths: list = field(default_factory=lambda: [64, 128, 256, 512])
+    pointnet_widths: list = field(default_factory=lambda: [64, 128, 256, 512])   # pointnet2: its final PointNet
+    sa_centres: list = field(default_factory=lambda: [512, 128])      # pointnet2: centres per set-abstraction level
+    sa_neighbours: list = field(default_factory=lambda: [32, 32])     # pointnet2: nearest points grouped per centre
+    sa_widths: list = field(default_factory=lambda: [[64, 64, 128], [128, 128, 256]])   # pointnet2: group PointNets
+    sa_sampling: str = "radial"               # pointnet2 and pointnext centres: radial (follow the density) | fps
+    nx_width: int = 32                        # pointnext: stem width
+    nx_centres: list = field(default_factory=lambda: [1024, 512, 256, 128])   # pointnext: centres per stage
+    nx_neighbours: list = field(default_factory=lambda: [32, 32, 32, 32])     # pointnext: nearest points per group
+    nx_widths: list = field(default_factory=lambda: [64, 128, 256, 256])      # pointnext: width per stage
+    nx_blocks: list = field(default_factory=lambda: [1, 2, 1, 1])             # pointnext: InvResMLP blocks per stage
+    nx_expansion: int = 4                     # pointnext: inverted-bottleneck expansion of the blocks
     shared_encoder: bool = False              # one PointNet for all modalities (own first layer and head each)
     dropout: float = 0.0
     encoder_dim: int = 512
@@ -89,11 +110,32 @@ class TrainConfig:
     wandb_project: str = "galaxyclip3d"
 
     def __post_init__(self):
-        for k, ok in (("inputs", INPUTS), ("loss_pairs", ("all", "stars_anchor")), ("patch_centres", ("fps", "radial"))):
+        for k, ok in (("inputs", INPUTS), ("loss_pairs", ("all", "stars_anchor")), ("patch_centres", ("fps", "radial")),
+                      ("dm_aperture", DM_APERTURES), ("encoder", ("patch", "pointnet", "pointnet2", "pointnext")),
+                      ("sa_sampling", ("radial", "fps"))):
             if getattr(self, k) not in ok:
                 raise SystemExit(f"{k} must be one of {ok}, got {getattr(self, k)!r}")
         if self.shared_encoder and self.encoder != "pointnet":
             raise SystemExit("shared_encoder needs encoder=pointnet")
+        given = list(self.modalities)
+        if len(given) < 2 or set(given) - set(MODALITIES) or len(set(given)) != len(given):
+            raise SystemExit(f"modalities must be at least two distinct names from {MODALITIES}, got {given}")
+        self.modalities = [m for m in MODALITIES if m in given]          # always in the order of MODALITIES
+        if self.loss_pairs == "stars_anchor" and "stars" not in self.modalities:
+            raise SystemExit("loss_pairs=stars_anchor needs the stars modality")
+        if self.min_particles < 0 or (self.min_particles and self.points > self.min_particles):
+            raise SystemExit(f"min_particles must be 0 (the dataset's) or at least points, got {self.min_particles}")
+        c, k, w = self.sa_centres, self.sa_neighbours, self.sa_widths
+        if self.encoder == "pointnet2" and (not c or not len(c) == len(k) == len(w) or min(c) < 1 or min(k) < 1
+                                            or any(b >= a for a, b in zip(c[:-1], c[1:])) or not all(w)):
+            raise SystemExit(f"pointnet2 needs one entry per level in sa_centres (falling), sa_neighbours and "
+                             f"sa_widths, got {c}, {k}, {w}")
+        c, k, w, nb = self.nx_centres, self.nx_neighbours, self.nx_widths, self.nx_blocks
+        if self.encoder == "pointnext" and (not c or not len(c) == len(k) == len(w) == len(nb) or min(c) < 1
+                                            or min(k) < 1 or min(w) < 1 or min(nb) < 0 or self.nx_width < 1
+                                            or self.nx_expansion < 1 or any(b >= a for a, b in zip(c[:-1], c[1:]))):
+            raise SystemExit(f"pointnext needs one entry per stage in nx_centres (falling), nx_neighbours, nx_widths "
+                             f"and nx_blocks, got {c}, {k}, {w}, {nb}")
 
     @classmethod
     def from_file(cls, path: str | None, overrides: list[str]) -> "TrainConfig":
@@ -118,18 +160,23 @@ def log(msg: str) -> None:
 
 
 def build_model(cfg: TrainConfig) -> MultiModalCLIP:
-    dims = {m: len(FEATURES[m]) for m in MODALITIES}
-    columns = None if cfg.inputs == "all" else {m: input_columns(m, cfg.inputs) for m in MODALITIES}
+    dims = {m: len(FEATURES[m]) for m in cfg.modalities}
+    columns = None if cfg.inputs == "all" else {m: input_columns(m, cfg.inputs) for m in cfg.modalities}
     return MultiModalCLIP(dims, cfg.encoder, cfg.embed_dim, cfg.encoder_dim, cfg.temperature, cfg.learn_temperature,
                           columns=columns, shared_encoder=cfg.shared_encoder, point_invariants=cfg.point_invariants,
                           width=cfg.width, depth=cfg.depth, heads=cfg.heads, patches=cfg.patches,
                           patch_size=cfg.patch_size, pointnet_widths=tuple(cfg.pointnet_widths), dropout=cfg.dropout,
-                          patch_centres=cfg.patch_centres)
+                          patch_centres=cfg.patch_centres, sa_centres=tuple(cfg.sa_centres),
+                          sa_neighbours=tuple(cfg.sa_neighbours), sa_widths=tuple(tuple(x) for x in cfg.sa_widths),
+                          sa_sampling=cfg.sa_sampling, nx_width=cfg.nx_width, nx_centres=tuple(cfg.nx_centres),
+                          nx_neighbours=tuple(cfg.nx_neighbours), nx_widths=tuple(cfg.nx_widths),
+                          nx_blocks=tuple(cfg.nx_blocks), nx_expansion=cfg.nx_expansion)
 
 
 def build_datasets(cfg: TrainConfig):
     kw = dict(radius=cfg.radius, snapshots=cfg.snapshots, gas_required=cfg.gas_required, rotation=cfg.rotation,
-              mirror=cfg.mirror, budget=cfg.points or None, common_radii=cfg.common_radii)
+              mirror=cfg.mirror, budget=cfg.points or None, common_radii=cfg.common_radii, dm_aperture=cfg.dm_aperture,
+              rvmax_subset=cfg.rvmax_subset, min_particles=cfg.min_particles or None, modalities=cfg.modalities)
     return PointCloudDataset(cfg.data, "train", **kw), PointCloudDataset(cfg.data, "val", **kw)
 
 
@@ -149,31 +196,34 @@ def lr_factor(step: int, warmup: int, total: int, floor: float) -> float:
     return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
 
 
-def to_device(batch: dict, device) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-    clouds = {m: batch[m].to(device, non_blocking=True) for m in MODALITIES}
-    return clouds, batch["mask"].to(device, non_blocking=True)
+def to_device(batch: dict, device, modalities=MODALITIES) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """The clouds of `modalities` and their mask columns, in that order (as multimodal.py expects them)."""
+    clouds = {m: batch[m].to(device, non_blocking=True) for m in modalities}
+    cols = [MODALITIES.index(m) for m in modalities]
+    return clouds, batch["mask"][:, cols].to(device, non_blocking=True)
 
 
 @torch.no_grad()
 def evaluate(model, loader, device, cfg: TrainConfig, amp_dtype) -> dict[str, float]:
     model.eval()
-    embs = {m: [] for m in MODALITIES}
+    mods = tuple(cfg.modalities)
+    embs = {m: [] for m in mods}
     masks, mstar = [], []
     for batch in loader:
-        clouds, mask = to_device(batch, device)
+        clouds, mask = to_device(batch, device, mods)
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             out = model(clouds)
-        for m in MODALITIES:
+        for m in mods:
             embs[m].append(out[m].float())
         masks.append(mask)
         mstar.append(batch["mstar"])
     emb = {m: torch.cat(v) for m, v in embs.items()}
     mask = torch.cat(masks)
-    res = masked_recall(emb, mask, tuple(cfg.ks))
+    res = masked_recall(emb, mask, tuple(cfg.ks), modalities=mods)
     if cfg.mass_bin_dex > 0:
         logm = torch.log10(torch.cat(mstar).double().clamp_min(1.0))
         bins = torch.floor(logm / cfg.mass_bin_dex).long().to(device)
-        res.update({f"massbin_{k}": v for k, v in masked_recall(emb, mask, (1,), groups=bins).items()
+        res.update({f"massbin_{k}": v for k, v in masked_recall(emb, mask, (1,), groups=bins, modalities=mods).items()
                     if k.startswith(("r1/", "chance/mean"))})
     res["galaxies"] = int(len(mask))
     return res
@@ -249,12 +299,18 @@ def main(argv=None) -> None:
         except Exception as e:                                            # noqa: BLE001
             log(f"W&B unavailable ({e}); logging to history.json only")
     install_requeue_handler()
+    defaults = {f.name: f.default_factory() if f.default is dataclasses.MISSING else f.default
+                for f in dataclasses.fields(TrainConfig)}
     log(f"{cfg.encoder} encoders, {n_params / 1e6:.1f} M parameters, on {device}; train {len(train_ds):,} galaxies "
         f"({steps_per_epoch} steps of {cfg.batch_size}), val {len(val_ds):,}; rotation {cfg.rotation}"
         f"{' + mirror' if cfg.mirror else ''}; control {cfg.control}" +
-        "".join(f"; {k} {getattr(cfg, k)}" for k in ("points", "common_radii", "inputs", "point_invariants",
-                                                     "patch_centres", "shared_encoder", "loss_pairs")
-                if getattr(cfg, k) != TrainConfig.__dataclass_fields__[k].default))
+        "".join(f"; {k} {getattr(cfg, k)}" for k in ("points", "min_particles", "modalities", "common_radii", "inputs",
+                                                     "point_invariants", "patch_centres", "shared_encoder",
+                                                     "loss_pairs", "dm_aperture", "rvmax_subset", "sa_centres",
+                                                     "sa_neighbours", "sa_widths", "sa_sampling", "nx_width",
+                                                     "nx_centres", "nx_neighbours", "nx_widths", "nx_blocks",
+                                                     "nx_expansion")
+                if getattr(cfg, k) != defaults[k]))
 
     def eval_model():
         return evaluate(ema_model if ema_model is not None else model, val_loader, device, cfg, amp_dtype)
@@ -281,7 +337,8 @@ def main(argv=None) -> None:
         report(0, eval_model())
 
     gen = torch.Generator(device=device).manual_seed(cfg.seed)
-    train_pairs = pairs(MODALITIES, anchor="stars" if cfg.loss_pairs == "stars_anchor" else None)
+    mods = tuple(cfg.modalities)
+    train_pairs = pairs(mods, anchor="stars" if cfg.loss_pairs == "stars_anchor" else None)
     for epoch in range(start_epoch, cfg.epochs):
         model.train()
         if sampler is not None:
@@ -292,12 +349,12 @@ def main(argv=None) -> None:
             if i >= steps_per_epoch:
                 break
             wait += time.time() - tw
-            clouds, mask = to_device(batch, device)
+            clouds, mask = to_device(batch, device, mods)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 emb = model(clouds)
             if cfg.control == "shuffle_pairs":
-                emb, mask = shuffle_partners(emb, mask, gen)
-            loss, pair = masked_all_pairs_loss(emb, mask, model.temperature(), pair_list=train_pairs)
+                emb, mask = shuffle_partners(emb, mask, gen, modalities=mods)
+            loss, pair = masked_all_pairs_loss(emb, mask, model.temperature(), modalities=mods, pair_list=train_pairs)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)

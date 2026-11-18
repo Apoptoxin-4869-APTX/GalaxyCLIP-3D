@@ -82,8 +82,9 @@ def random_orthogonal(rng: np.random.Generator, mirror: bool = True) -> np.ndarr
 def orient(clouds: dict[str, np.ndarray], rng: np.random.Generator, mode: str = "independent",
            mirror: bool = True) -> dict[str, np.ndarray]:
     """Turn positions and velocities (columns 0-2 and 3-5) of each cloud: every modality by its own random matrix
-    ("independent"), all by one ("shared"), or not at all ("none"). Random numbers are drawn in MODALITIES order
-    whether or not a cloud is empty, so a seeded rng gives the same result every time."""
+    ("independent"), all by one ("shared"), or not at all ("none"). A matrix is drawn for every modality in
+    MODALITIES order, whether its cloud is empty or left out of `clouds`, so a seeded rng gives a modality the same
+    matrix every time, whichever other modalities are there."""
     if mode not in ORIENTATIONS:
         raise ValueError(f"orientation must be one of {ORIENTATIONS}, not {mode!r}")
     if mode == "none":
@@ -91,9 +92,9 @@ def orient(clouds: dict[str, np.ndarray], rng: np.random.Generator, mode: str = 
     shared = random_orthogonal(rng, mirror) if mode == "shared" else None
     out = {}
     for mod in MODALITIES:
+        r = shared if shared is not None else random_orthogonal(rng, mirror)
         if mod not in clouds:
             continue
-        r = shared if shared is not None else random_orthogonal(rng, mirror)
         c = np.array(clouds[mod], dtype=np.float32, copy=True)
         c[:, 0:3] = c[:, 0:3] @ r.T
         c[:, 3:6] = c[:, 3:6] @ r.T
@@ -106,15 +107,20 @@ def in_ball(rng: np.random.Generator, n: int) -> np.ndarray:
     return v / np.linalg.norm(v, axis=1, keepdims=True) * rng.random((n, 1)) ** (1.0 / 3.0)
 
 
-def draw(particles: dict[str, dict[str, np.ndarray]], radius_kpc: float, vmax: float, budget: int,
-         rng: np.random.Generator, rotate: bool = True) -> dict[str, np.ndarray]:
-    """{modality: (budget, len(FEATURES[modality])) float32}; all zeros when a modality has nothing to draw from."""
+def draw(particles: dict[str, dict[str, np.ndarray]], radius_kpc: float | dict[str, float], vmax: float, budget: int,
+         rng: np.random.Generator, rotate: bool = True, modalities=MODALITIES) -> dict[str, np.ndarray]:
+    """{modality: (budget, len(FEATURES[modality])) float32} for each of `modalities` (the others are not drawn); all
+    zeros when a modality has nothing to draw from. radius_kpc is one sphere for every modality, or {modality: radius}
+    (e.g. a dark-matter sphere of its own); each cloud's positions are divided by its own sphere's radius."""
     rot = random_rotation(rng) if rotate else np.eye(3)
     vscale = vmax if vmax > 0 else 1.0
     out = {}
     for mod in MODALITIES:
+        if mod not in modalities:
+            continue
         p = particles[SOURCE[mod]]
-        inside = np.flatnonzero(np.linalg.norm(p["pos"], axis=1) <= radius_kpc)
+        r_mod = float(radius_kpc[mod]) if isinstance(radius_kpc, dict) else radius_kpc
+        inside = np.flatnonzero(np.linalg.norm(p["pos"], axis=1) <= r_mod)
         w = weights(mod, {k: v[inside] for k, v in p.items() if k in ("mass", "m_hi", "wcorr")})
         if len(inside) == 0 or w.sum() <= 0:
             out[mod] = np.zeros((budget, len(FEATURES[mod])), dtype=np.float32)
@@ -123,7 +129,7 @@ def draw(particles: dict[str, dict[str, np.ndarray]], radius_kpc: float, vmax: f
         pos = p["pos"][pick].astype(np.float64)
         if mod in ("gas", "hi"):
             pos += in_ball(rng, len(pick)) * p["r_cell"][pick, None]
-        cols = [pos @ rot.T / radius_kpc, p["vel"][pick].astype(np.float64) @ rot.T / vscale]
+        cols = [pos @ rot.T / r_mod, p["vel"][pick].astype(np.float64) @ rot.T / vscale]
         cols += [p[f][pick, None].astype(np.float64) for f in SCALARS[mod]]
         out[mod] = np.concatenate(cols, axis=1).astype(np.float32)
     return out

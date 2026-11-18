@@ -225,11 +225,11 @@ galaxy for 35% (stars→gas), 31% (stars→HI) and 10% (stars→dark matter) of 
 | Piece | Code |
 |---|---|
 | masked all-pairs InfoNCE, masked full-gallery recall (2D functions untouched) | `galaxyclip3d/multimodal.py` |
-| encoders: PointNet (1.2 M parameters per modality), patch transformer à la Point-MAE (11.9 M) | `galaxyclip3d/models/` |
+| encoders: PointNet (1.2 M parameters per modality), patch transformer à la Point-MAE (11.9 M), PointNet++ and PointNeXt (2.2 and 2.3 M at the Stage E settings) | `galaxyclip3d/models/` |
 | training (one GPU, bf16, AdamW + cosine, ZClip, optional EMA, requeue, W&B optional) | `galaxyclip3d/train_clip.py`, `configs/clip_*.json` |
 | job: copies the dataset to the node's local disk, excludes trinity, fresko and irvine | `slurm/train_clip.submit` |
 | properties for probes (halo mass, SFR, metallicities, colour, stellar age, HI mass) | `tools/build_targets.py` → `snap_099/targets.h5` |
-| tests (orientation, masked loss and recall, encoders, ablation options, a short synthetic training run, scoring and probe helpers) | `tests/test_clip.py` |
+| tests (orientation, masked loss and recall, encoders, ablation options, a short synthetic training run, scoring and probe helpers, Stage E settings) | `tests/test_clip.py` |
 
 ```bash
 env -u SLURM_JOB_ID sbatch slurm/train_clip.submit configs/clip_pointnet.json                    # PointNet baseline
@@ -252,6 +252,7 @@ Ablation settings for Phase C, all off by default:
 | `loss_pairs=stars_anchor` | trains only the three stars pairs; validation still covers all 12 directions |
 | `shared_encoder=true` | one PointNet for all modalities, each with its own first layer and projection head |
 | `patch_centres=radial` | patch centres picked in radially equalised positions, so they follow the density |
+| `dm_aperture=vmax` | cuts the dark matter at the galaxy's R_vmax and scales it by R_vmax instead of the stellar sphere, so the dark-matter cloud no longer carries the stars' size (a control for the probes); needs `r_vmax_kpc` in `targets.h5`, keeps the ~80% of galaxies whose R_vmax lies inside the stored particles with at least 4,096 dark-matter particles, and draws seeded validation clouds instead of the frozen ones |
 
 **Scoring finished runs (Phase D).** The test set is scored once, after the final setup is fixed; validation is used
 for every choice before that.
@@ -264,6 +265,7 @@ for every choice before that.
 | probes on each modality's embedding, next to hand-made statistics and the untrained network | `tools/probe_clip.py` |
 | the no-network baselines on the test set | `tools/clip_baselines.py --split test` |
 | thesis figures (PDF + PNG) and tables (LaTeX + Markdown) from the saved results, with bootstrap intervals over test galaxies | `tools/clip_report.py` → `outputs/clip/report/` |
+| probes and retrieval of several cached feature sets on the galaxies they share (e.g. a run with another dark-matter sphere against the final setup) | `tools/compare_probes.py` |
 
 ```bash
 V3=/cluster/projects/ska/illustris/tng50-1.pointclouds/v3
@@ -279,6 +281,41 @@ Probe features of the training galaxies come from one fixed draw per galaxy (`Po
 seeded by draw seed, snapshot and subhalo); validation and test galaxies use their frozen clouds. Property floors from
 `build_targets.py` (no gas, no black hole, no star formation) are left out of the fits; "quenched" (no star formation)
 is probed as a yes/no property instead.
+
+**Stage E settings (2026-11-18).** Stage E leaves out HI for now and uses larger clouds of larger galaxies.
+`configs/clip_stage_e.json` is the final setup (C21) with three changes:
+
+| Setting | Stage E | Effect |
+|---|---|---|
+| `modalities` | `["stars", "dm", "gas"]` | one encoder per listed modality; the loss uses their 3 pairs, and validation R@1 (which picks best.pt) is the mean over their 6 directions |
+| `min_particles` | `8192` | at least 8,192 star and 8,192 dark-matter particles inside the sphere, and 8,192 gas cells for the gas modality (else masked): 3,036 / 406 / 367 galaxies instead of 4,052 / 520 / 499 (gas on for 2,056 / 306 / 262). Only values above the dataset's 4,096 work |
+| `points` | `4096` | points per cloud; the frozen 4,096-point validation and test sets exist |
+
+The frozen validation clouds of the remaining galaxies are the ones every earlier run was scored on. For a
+like-for-like reference, `tools/eval_clip.py --min-particles 8192 --modalities stars dm gas` scores a four-modality
+run on the same galaxies without HI: the final setup (trained with HI, scored at its own 2,048 points) reaches
+**42.4 ± 0.4% R@1** over the 6 directions on the 406 validation galaxies (3 seeds; stars–DM 22.9%, stars–gas 86.9%,
+DM–gas 17.4%; `outputs/clip/stage_e/val_reference_final_no_hi.json`).
+
+`configs/clip_stage_e_pointnet2.json` is the same with PointNet++ encoders (`encoder=pointnet2`), to test whether
+local structure helps: two set-abstraction levels of 512 and 128 centres, each grouped with its 32 nearest points,
+then a PointNet over the 128 centres (`pointnet_widths`). Centres come from farthest-point sampling in radially
+equalised positions (`sa_sampling=radial`): on real star clouds that puts 46% of 512 centres inside the radius holding
+half the points, plain farthest-point sampling 1%. 7.4 M parameters in all, against 6.8 M for the Stage E PointNet.
+
+`configs/clip_stage_e_pointnext.json` uses PointNeXt encoders (`encoder=pointnext`, Qian et al. 2022): a stem layer,
+then four stages, each a set-abstraction block followed by residual InvResMLP blocks (PointNeXt-B's pattern 1, 2, 1, 1;
+blocks widen 4x and back). The 4,096 points are reduced to 1,024, 512, 256 and 128 centres with 32 nearest points per
+group; widths 64, 128, 256, 256 (capped so an encoder has 2.3 M parameters, 7.6 M in all). Adapted like the PointNet++:
+radially equalised centres, nearest points with positions divided by the group radius and its logarithm kept,
+LayerNorm after the max. On the CPU a forward and backward pass takes about 3 times as long as the PointNet's.
+
+```bash
+env -u SLURM_JOB_ID sbatch slurm/train_clip.submit configs/clip_stage_e.json \
+    --set run_name=e01_baseline out_dir=outputs/clip/stage_e/e01_baseline
+PYTHONPATH=pylibs:. python -s tools/eval_clip.py --data $V3 --split val --runs outputs/clip/phase_c/c21_combined \
+    --min-particles 8192 --modalities stars dm gas --save outputs/clip/stage_e/val_reference_c21.json
+```
 
 ## Code shared with GalaxyCLIP-2D
 
