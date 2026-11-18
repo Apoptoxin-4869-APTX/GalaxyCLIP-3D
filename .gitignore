@@ -16,3 +16,6 @@ __pycache__/
 .claude/
 wandb/
 slurm/log/
+
+# Personal title-page details for the project report and deck (report/README.md)
+report/title.local.json
