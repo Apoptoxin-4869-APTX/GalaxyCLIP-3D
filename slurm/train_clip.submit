@@ -3,9 +3,11 @@
 #
 #   env -u SLURM_JOB_ID sbatch slurm/train_clip.submit configs/clip_pointnet.json [--set key=value ...]
 #
-# The dataset (47 GB) is copied to the job's local /scratch first (1-2 min): reading it from the shared storage is
-# about 450 ms per galaxy cold, against about 27 ms from memory, and data feeding sets the pace. Checkpoints go to the
-# config's out_dir in the repo; a requeued job resumes from its latest.pt.
+# The dataset (v3, 47 GB) is copied to the job's local /scratch first (1-2 min): reading it from the shared storage is
+# about 450 ms per galaxy cold, against about 27 ms from memory, and data feeding sets the pace. SOURCE_DATA=<folder> in
+# the environment copies another dataset, e.g. tng50-1.pointclouds/complete (six snapshots, 279 GB, ~5 min; its Stage E
+# training galaxies hold 204 GB, so give such jobs --mem=280G for the page cache, and more CPUs with WORKERS=N).
+# Checkpoints go to the config's out_dir in the repo; a requeued job resumes from its latest.pt.
 #
 # Cluster rules this keeps:
 #   * --account=cai_ivs and --gres-flags=enforce-binding on every GPU job; submit with `env -u SLURM_JOB_ID sbatch`
@@ -34,8 +36,8 @@
 set -uo pipefail
 PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
 PYTHON=/cluster/home/magilolg/venvs/tts-fish/bin/python
-SOURCE_DATA=/cluster/projects/ska/illustris/tng50-1.pointclouds/v3
-DATA="/scratch/${USER}/pointclouds_v3"
+SOURCE_DATA="${SOURCE_DATA:-/cluster/projects/ska/illustris/tng50-1.pointclouds/v3}"
+DATA="/scratch/${USER}/pointclouds_$(basename "${SOURCE_DATA}")"
 CONFIG="${1:?give the config file as the first argument}"
 shift
 WORKERS="${WORKERS:-16}"
@@ -52,6 +54,7 @@ sig_handler_USR1() {
 trap 'sig_handler_USR1' USR1
 
 echo "[clip] $(date) on $(hostname), job ${SLURM_JOB_ID:-none}, config ${CONFIG} $*"
+echo "[data] ${SOURCE_DATA}, ${WORKERS} loader workers"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 mkdir -p "${DATA}"
 t0=$(date +%s)

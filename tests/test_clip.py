@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO))
 from galaxyclip3d import train_clip                                                    # noqa: E402
 from galaxyclip3d.losses import info_nce_loss                                          # noqa: E402
 from galaxyclip3d.models import MultiModalCLIP, farthest_point_sample                  # noqa: E402
-from galaxyclip3d.models.clip import invariant_features                                # noqa: E402
+from galaxyclip3d.models.clip import FLIPS, flip_axes, invariant_features, principal_frame  # noqa: E402
 from galaxyclip3d.models.encoders import radial_equalise                               # noqa: E402
 from galaxyclip3d.multimodal import MODALITIES, masked_all_pairs_loss, masked_recall, pairs, shuffle_partners  # noqa
 from galaxyclip3d.pointclouds.sampling import FEATURES, input_columns, orient          # noqa: E402
@@ -121,7 +121,9 @@ for kind, extra in (("pointnet", {}), ("patch", {}), ("patch", {"patch_centres":
                     ("pointnet2", {"sa_centres": (16, 4), "sa_neighbours": (8, 4), "sa_widths": ((16, 16), (16, 32))}),
                     ("pointnet2", {"sa_centres": (16, 4), "sa_neighbours": (8, 4), "sa_widths": ((16, 16), (16, 32)), "sa_sampling": "fps", "point_invariants": True}),
                     ("pointnext", {"nx_width": 8, "nx_centres": (32, 16, 8, 4), "nx_neighbours": (8, 8, 4, 4), "nx_widths": (16, 16, 32, 32), "nx_blocks": (1, 2, 0, 1)}),
-                    ("pointnext", {"nx_width": 8, "nx_centres": (32, 16, 8, 4), "nx_neighbours": (8, 8, 4, 4), "nx_widths": (16, 16, 32, 32), "nx_blocks": (1, 2, 0, 1), "sa_sampling": "fps", "point_invariants": True})):
+                    ("pointnext", {"nx_width": 8, "nx_centres": (32, 16, 8, 4), "nx_neighbours": (8, 8, 4, 4), "nx_widths": (16, 16, 32, 32), "nx_blocks": (1, 2, 0, 1), "sa_sampling": "fps", "point_invariants": True}),
+                    ("vn_pointnet", {"vn_widths": (8, 16), "vn_scalar_widths": (16, 32)}),
+                    ("vn_pointnet", {"vn_widths": (8, 16), "vn_scalar_widths": (16, 32), "point_invariants": True})):
     model = MultiModalCLIP(DIMS, kind, embed_dim=64, encoder_dim=64, width=64, depth=2, heads=4, patches=16,
                            patch_size=8, pointnet_widths=(16, 32), **extra)
     xb = {m: torch.randn(3, 128, d) for m, d in DIMS.items()}
@@ -168,7 +170,8 @@ for bad in (dict(sampling="random"), dict(centres=(16, 32, 8)), dict(blocks=(1, 
         pass
 lt = MultiModalCLIP(DIMS, "pointnet", embed_dim=8, encoder_dim=8, learn_temperature=True, pointnet_widths=(8,))
 assert isinstance(lt.logit_scale, torch.nn.Parameter) and abs(float(lt.temperature().detach()) - 0.07) < 1e-6
-print("PASS encoders (PointNet, patch transformer, PointNet++, PointNeXt): shapes, unit-length embeddings, same "
+print("PASS encoders (PointNet, patch transformer, PointNet++, PointNeXt, Vector Neurons): shapes, unit-length "
+      "embeddings, same "
       "output for shuffled points, masked clouds finite, PointNet++ levels sized as designed and bad levels refused, "
       "PointNeXt stages as designed (one or two layers per set abstraction, blocks widened 4x and residual), bad "
       "stages refused, "
@@ -190,6 +193,28 @@ changed = {m: v.clone() for m, v in xb.items()}
 changed["stars"][..., 3:6] += 5.0
 assert not torch.allclose(plain(xb)["stars"], plain(changed)["stars"]), "with all columns, velocities matter"
 assert input_columns("dm", "no_velocities") == [0, 1, 2] and input_columns("gas", "no_scalars") == list(range(6))
+no_age = train_clip.TrainConfig(modalities=["stars", "dm", "gas"], drop_inputs=["stars.age"], encoder="pointnet",
+                                 pointnet_widths=[16], embed_dim=16, encoder_dim=16)
+cols = train_clip.encoder_columns(no_age)
+assert cols["stars"] == [0, 1, 2, 3, 4, 5, 7] and cols["dm"] == list(range(6)) and cols["gas"] == list(range(12))
+assert train_clip.encoder_columns(train_clip.TrainConfig()) is None, "nothing hidden: clouds go in as they are"
+age = FEATURES["stars"].index("age")
+for kind in ("pointnet", "patch"):
+    cfg_k = train_clip.TrainConfig(modalities=["stars", "dm", "gas"], drop_inputs=["stars.age"], encoder=kind,
+                                   pointnet_widths=[16], embed_dim=16, encoder_dim=16, width=16, depth=1, heads=2,
+                                   patches=8, patch_size=8)
+    mdl = train_clip.build_model(cfg_k).eval()
+    first = mdl.encoders["stars"].point_mlp[0] if kind == "pointnet" else mdl.encoders["stars"].local1[0]
+    assert first.in_features == len(FEATURES["stars"]) - 1, f"{kind}: one stellar input fewer"
+    sub = {m: xb[m][..., :len(FEATURES[m])] for m in cfg_k.modalities}
+    older = {m: v.clone() for m, v in sub.items()}
+    older["stars"][..., age] += 5.0
+    richer = {m: v.clone() for m, v in sub.items()}
+    richer["stars"][..., FEATURES["stars"].index("log_z")] += 5.0
+    with torch.no_grad():
+        a, b, c = mdl(sub), mdl(older), mdl(richer)
+    assert torch.allclose(a["stars"], b["stars"]), f"{kind}: the hidden age must not matter"
+    assert not torch.allclose(a["stars"], c["stars"]), f"{kind}: metallicity still matters"
 sh = MultiModalCLIP(DIMS, "pointnet", embed_dim=16, encoder_dim=16, pointnet_widths=(16, 32), shared_encoder=True)
 sep = MultiModalCLIP(DIMS, "pointnet", embed_dim=16, encoder_dim=16, pointnet_widths=(16, 32))
 assert sh.encoders["stars"][1] is sh.encoders["dm"][1] is sh.encoders["hi"][1], "one trunk for all modalities"
@@ -239,11 +264,195 @@ for v in changed.values():
     v[..., 3:6] += 5.0
 assert all(torch.allclose(nv(xb)[m], nv(changed)[m]) for m in MODALITIES), "velocities leaked in through the invariants"
 assert not torch.allclose(inv(xb)["stars"], inv(changed)["stars"]), "with velocities, the invariants use them"
-print(f"PASS ablation options: dropped input columns are ignored, one shared PointNet trunk with its own first layer "
+print(f"PASS ablation options: dropped input columns are ignored (a hidden stellar age too, PointNet and patch), "
+      f"one shared PointNet trunk with its own first layer "
       f"per modality (fewer parameters, checkpoint round trip), radial patch centres put {inner['radial']:.0%} of "
       f"centres in the inner half of a concentrated cloud against {inner['fps']:.0%} for plain farthest-point sampling; "
       f"point invariants are unchanged by rotation and mirroring, exact on a known point, zero for masked clouds, and "
       f"carry no velocities when velocities are dropped")
+
+
+# ---------------------------------------------------------------- principal axes
+gen = torch.Generator().manual_seed(3)
+LENGTHS = torch.tensor([3.0, 2.0, 1.0])                                # distinct axis lengths: a well-defined frame
+
+
+def o3(g):
+    """A random 3 x 3 orthogonal matrix: a rotation, or a rotation and a mirror."""
+    return torch.linalg.qr(torch.randn(3, 3, generator=g))[0]
+
+
+def turn(cloud, mat):
+    out = cloud.clone()
+    out[..., 0:3], out[..., 3:6] = cloud[..., 0:3] @ mat.T, cloud[..., 3:6] @ mat.T
+    return out
+
+
+base = torch.randn(4, 500, 8, generator=gen)
+base[..., 0:3] *= LENGTHS
+pf = principal_frame(base)
+mom = pf[..., 0:3].transpose(-1, -2) @ pf[..., 0:3]
+diag = torch.diagonal(mom, dim1=-2, dim2=-1)
+assert (mom - torch.diag_embed(diag)).abs().max() < 1e-4 * diag.max(), "second moments are diagonal in the frame"
+assert (diag[:, 0] > diag[:, 1]).all() and (diag[:, 1] > diag[:, 2]).all(), "x along the longest axis, z the shortest"
+assert torch.equal(pf[..., 6:], base[..., 6:]), "scalar columns untouched"
+assert torch.allclose(invariant_features(pf), invariant_features(base), atol=1e-4), "a rotation, not a distortion"
+mirrored = 0
+for mat in [o3(gen) for _ in range(3)]:
+    for m3 in (mat, -mat):                                             # opposite determinants: one of them mirrors
+        mirrored += int(torch.det(m3) < 0)
+        moved = principal_frame(turn(base, m3))
+        signs = torch.sign((moved[..., 0:3] * pf[..., 0:3]).sum(-2))  # (clouds, 3): how each axis came out
+        assert torch.allclose(moved, flip_axes(pf, signs), atol=1e-4), "same frame up to the sign of each axis"
+assert mirrored == 3
+zero = principal_frame(torch.zeros(2, 10, 7))
+assert torch.isfinite(zero).all() and not zero.any(), "a masked cloud stays all zeros"
+assert len(set(FLIPS)) == 8 and sum(int(np.prod(f) < 0) for f in FLIPS) == 4, "4 rotations, 4 mirror images"
+
+pa = MultiModalCLIP(DIMS, "pointnet", embed_dim=16, encoder_dim=16, pointnet_widths=(16, 32), principal_axes=True)
+asis = MultiModalCLIP(DIMS, "pointnet", embed_dim=16, encoder_dim=16, pointnet_widths=(16, 32))
+asis.load_state_dict(pa.state_dict())                                 # no extra parameters: same layout
+xb = {m: torch.randn(3, 200, d, generator=gen) for m, d in DIMS.items()}
+for v in xb.values():
+    v[..., 0:3] *= LENGTHS
+xb["gas"][1] = 0                                                       # a masked cloud
+pa.eval(), asis.eval()
+with torch.no_grad():
+    e0, a0 = pa(xb), asis(xb)
+    for _ in range(3):                                                 # every modality turned on its own
+        moved = {m: turn(v, o3(gen)) for m, v in xb.items()}
+        e1, a1 = pa(moved), asis(moved)
+        assert all(torch.allclose(e0[m], e1[m], atol=1e-5) for m in MODALITIES), "eval: rotation or mirror changed it"
+        assert not torch.allclose(a0["stars"], a1["stars"], atol=1e-3), "without the frame, orientation matters"
+    assert all(torch.isfinite(e0[m]).all() and torch.allclose(e0[m].norm(dim=1), torch.ones(3)) for m in MODALITIES)
+    pa.train()
+    torch.manual_seed(5)
+    picks = []
+    for _ in range(4):
+        et = pa.embed("stars", xb["stars"])
+        frame = principal_frame(xb["stars"])
+        each = torch.stack([pa.embed_as_given("stars", flip_axes(frame, torch.tensor(f).expand(3, 3))) for f in FLIPS])
+        hit = (each - et[None]).abs().amax(-1) < 1e-5                  # (8 sign choices, 3 clouds)
+        assert (hit.sum(0) >= 1).all(), "training: each cloud gets one of the 8 sign choices"
+        picks += hit.float().argmax(0).tolist()
+    assert len(set(picks)) > 2, "training: the sign choices vary"
+print(f"PASS principal axes: the frame diagonalises the second moments (longest axis first), leaves scalars alone, is "
+      f"a pure rotation, and comes out the same up to axis signs after 6 random rotations or mirrorings ({mirrored} "
+      f"mirrored); masked clouds stay zeros; in eval mode the model's embeddings are unchanged when every modality is "
+      f"turned on its own (the plain model's are not), with no extra parameters; in training mode each cloud gets one "
+      f"of the 8 sign choices, {len(set(picks))} different ones over 12 draws")
+
+# ---------------------------------------------------------------- Vector Neurons
+from galaxyclip3d.models.encoders import VNBlock, VNPointNetEncoder, vn_leaky_relu, vn_rms  # noqa: E402
+gen = torch.Generator().manual_seed(4)
+v0, s0, d0 = (torch.randn(2, 50, 3, 4, generator=gen), torch.randn(2, 50, 5, generator=gen),
+              torch.randn(2, 50, 3, 4, generator=gen))
+blk = VNBlock(4, 5, 6, 7)
+mirrored = 0
+for mat in [o3(gen) for _ in range(3)]:
+    for m3 in (mat, -mat):                                             # opposite determinants: one of them mirrors
+        mirrored += int(torch.det(m3) < 0)
+
+        def rot(v, m3=m3):
+            return torch.einsum("ij,bnjc->bnic", m3, v)
+        vb, sb = blk(v0, s0)
+        vr, sr = blk(rot(v0), s0)
+        assert torch.allclose(vr, rot(vb), atol=1e-5) and torch.allclose(sr, sb, atol=1e-5), \
+            "a block commutes with turns"
+        assert torch.allclose(vn_rms(rot(v0)), vn_rms(v0), atol=1e-5), "the root-mean-square length is invariant"
+        assert torch.allclose(vn_leaky_relu(rot(v0), rot(d0)), rot(vn_leaky_relu(v0, d0)), atol=1e-5)
+assert mirrored == 3
+along, d1 = torch.tensor([[2.0], [1.0], [0.0]]), torch.tensor([[1.0], [0.0], [0.0]])     # (3, 1): one channel
+assert torch.equal(vn_leaky_relu(along, d1), along), "a vector on its direction's side passes unchanged"
+assert torch.allclose(vn_leaky_relu(-along * torch.tensor([[1.0], [-1.0], [1.0]]), d1, 0.2),
+                      torch.tensor([[-0.4], [1.0], [0.0]]), atol=0.02), \
+    "the opposite side keeps 20% of its part along d"
+assert torch.allclose(vn_leaky_relu(2.5 * v0, d0), 2.5 * vn_leaky_relu(v0, d0), atol=1e-5), \
+    "positive factors pass through the LeakyReLU (so the block divides by the RMS length after it)"
+vz, sz = blk(torch.zeros(1, 2, 3, 4), torch.zeros(1, 2, 5))
+assert torch.equal(vz, torch.zeros(1, 2, 3, 6)) and torch.isfinite(sz).all(), "a masked cloud's vectors stay zeros"
+
+vn = MultiModalCLIP(DIMS, "vn_pointnet", embed_dim=16, encoder_dim=16, vn_widths=(8, 16, 16),
+                    vn_scalar_widths=(16, 32, 32))
+xb = {m: torch.randn(3, 200, d, generator=gen) for m, d in DIMS.items()}
+xb["gas"][1] = 0                                                       # a masked cloud
+for mode in ("train", "eval"):                                         # no frame, no averaging: the same in both modes
+    getattr(vn, mode)()
+    with torch.no_grad():
+        e0 = vn(xb)
+        for _ in range(2):
+            for sign in (1, -1):                                       # every modality turned on its own
+                e1 = vn({m: turn(v, sign * o3(gen)) for m, v in xb.items()})
+                assert all(torch.allclose(e0[m], e1[m], atol=1e-5) for m in MODALITIES), f"{mode}: a turn changed it"
+    assert all(torch.isfinite(e0[m]).all() and torch.allclose(e0[m].norm(dim=1), torch.ones(3)) for m in MODALITIES)
+with torch.no_grad():
+    for col, what in ((slice(6, None), "scalars"), (slice(3, 6), "velocities")):
+        changed = {m: v.clone() for m, v in xb.items()}
+        changed["stars"][..., col] += 0.5
+        assert not torch.allclose(vn(changed)["stars"], e0["stars"], atol=1e-3), f"the stars' {what} are used"
+for inputs, n_vec in (("no_velocities", 1), ("no_scalars", 2)):
+    cols = {m: input_columns(m, inputs) for m in MODALITIES}
+    sub = MultiModalCLIP(DIMS, "vn_pointnet", embed_dim=16, encoder_dim=16, vn_widths=(8, 16),
+                         vn_scalar_widths=(16, 32), columns=cols).eval()
+    assert all(sub.encoders[m].blocks[0].mix.in_features == n_vec for m in MODALITIES), inputs
+    with torch.no_grad():
+        e0s, e1s = sub(xb), sub({m: turn(v, -o3(gen)) for m, v in xb.items()})
+    assert all(torch.allclose(e0s[m], e1s[m], atol=1e-5) for m in MODALITIES), f"{inputs}: a turn changed it"
+vn.train()
+mk = torch.ones(3, len(MODALITIES), dtype=torch.bool)
+mk[1, MODALITIES.index("gas")] = False
+loss, _ = masked_all_pairs_loss(vn(xb), mk, vn.temperature())
+loss.backward()
+assert all(torch.isfinite(q.grad).all() for q in vn.parameters() if q.grad is not None), "finite gradients"
+assert float(vn.encoders["dm"].pool_direction.weight.grad.abs().max()) > 0, "the pooling direction is trained"
+ckpt = MultiModalCLIP(DIMS, "vn_pointnet", embed_dim=16, encoder_dim=16, vn_widths=(8, 16, 16),
+                      vn_scalar_widths=(16, 32, 32), vn_checkpoint=True).train()
+ckpt.load_state_dict(vn.state_dict())
+assert all(e.checkpoint for e in ckpt.encoders.values()) and not any(e.checkpoint for e in vn.encoders.values())
+loss_c, _ = masked_all_pairs_loss(ckpt(xb), mk, ckpt.temperature())
+loss_c.backward()
+same_grads = all(torch.allclose(a.grad, b.grad, atol=1e-6)
+                 for a, b in zip(ckpt.parameters(), vn.parameters()) if a.grad is not None)
+assert torch.allclose(loss_c, loss, atol=1e-6) and same_grads, \
+    "recomputing the layers in the backward pass gives the same loss and gradients"
+for bad in (lambda: MultiModalCLIP(DIMS, "vn_pointnet", principal_axes=True),
+            lambda: MultiModalCLIP(DIMS, "vn_pointnet", columns={m: [3, 4, 5, 0, 1, 2] for m in MODALITIES}),
+            lambda: VNPointNetEncoder(8, widths=(8,), scalar_widths=(8, 16)), lambda: VNPointNetEncoder(8, vectors=3),
+            lambda: VNPointNetEncoder(4, vectors=2)):
+    try:
+        bad()
+        raise AssertionError("should be refused")
+    except ValueError:
+        pass
+print(f"PASS Vector Neurons: a block and the LeakyReLU commute with 6 random turns ({mirrored} mirrored) and the "
+      f"RMS length is invariant; the LeakyReLU passes vectors on its direction's side, keeps 20% of the rest and lets "
+      f"positive factors through; masked clouds stay zeros; the model's embeddings are unchanged when every "
+      f"modality is turned on its own, in training and eval mode and without velocities or scalars; scalars and "
+      f"velocities are used; gradients are finite and reach the pooling direction; checkpointing gives the same loss "
+      f"and gradients; principal axes, misplaced vector columns and bad widths are refused")
+
+for shared in (False, True):                       # pointnet_checkpoint: layers recomputed in the backward pass
+    torch.manual_seed(5)
+    plain = MultiModalCLIP(DIMS, "pointnet", embed_dim=16, encoder_dim=16, pointnet_widths=(8, 16, 32),
+                           shared_encoder=shared).train()
+    redo = MultiModalCLIP(DIMS, "pointnet", embed_dim=16, encoder_dim=16, pointnet_widths=(8, 16, 32),
+                          shared_encoder=shared, pointnet_checkpoint=True).train()
+    redo.load_state_dict(plain.state_dict())                            # the option changes no weights
+    assert all((e[1] if shared else e).checkpoint for e in redo.encoders.values()), "it reaches every PointNet"
+    assert not any((e[1] if shared else e).checkpoint for e in plain.encoders.values())
+    pn_losses = []
+    for model in (plain, redo):
+        loss_m, _ = masked_all_pairs_loss(model(xb), mk, model.temperature())
+        loss_m.backward()
+        pn_losses.append(loss_m.detach())
+    assert torch.equal(pn_losses[0], pn_losses[1]), f"shared={shared}: the same loss"
+    assert all(torch.allclose(a.grad, b.grad, rtol=0, atol=1e-7) for a, b in zip(plain.parameters(), redo.parameters())
+               if a.grad is not None), f"shared={shared}: the same gradients"
+    with torch.no_grad():
+        e_plain, e_redo = plain.eval()(xb), redo.eval()(xb)
+    assert all(torch.equal(e_plain[m], e_redo[m]) for m in MODALITIES), f"shared={shared}: the same embeddings"
+print("PASS PointNet checkpointing: recomputing the layers in the backward pass gives the same loss, gradients and "
+      "embeddings and the same weights, with one encoder per modality and with a shared one")
 
 
 # ---------------------------------------------------------------- a short training run on synthetic galaxies
@@ -276,6 +485,25 @@ class Synthetic(torch.utils.data.Dataset):
         return item
 
 
+# ---------------------------------------------------------------- training and validation snapshots
+seen = []
+real_dataset = train_clip.PointCloudDataset
+train_clip.PointCloudDataset = lambda root, split, **kw: seen.append((split, kw["snapshots"]))
+for over, want in (([], [None, None]), (["snapshots=[91,99]"], [[91, 99], [91, 99]]),
+                   (["val_snapshots=[99]"], [None, [99]]),
+                   (["snapshots=[50,99]", "val_snapshots=[99]"], [[50, 99], [99]])):
+    seen.clear()
+    train_clip.build_datasets(train_clip.TrainConfig.from_file(None, over))
+    assert seen == [("train", want[0]), ("val", want[1])], (over, seen)
+train_clip.PointCloudDataset = real_dataset
+try:
+    train_clip.TrainConfig.from_file(None, ["val_snapshots=[]"])
+    raise AssertionError("an empty val_snapshots should be refused")
+except SystemExit:
+    pass
+print("PASS snapshots: training uses `snapshots` and validation `val_snapshots` (by default the same); an empty "
+      "val_snapshots is refused")
+
 tmp = Path(tempfile.mkdtemp(prefix="clip_test_"))
 train_clip.build_datasets = lambda cfg: (Synthetic(96, 1, False), Synthetic(40, 2, True))
 common = ["encoder=\"pointnet\"", "pointnet_widths=[32,64]", "encoder_dim=64", "embed_dim=32", "batch_size=16",
@@ -290,7 +518,8 @@ hist = json.loads((tmp / "run" / "history.json").read_text())
 assert [v["epoch"] for v in hist["val"]] == [0, 1, 2, 3, 4] and len(hist["train_loss"]) == 4, "resumed at epoch 3"
 train_clip.main(["--set", *common, "epochs=2", "control=\"shuffle_pairs\"", f"out_dir=\"{tmp / 'shuffled'}\""])
 train_clip.main(["--set", *common, "epochs=1", "inputs=\"no_velocities\"", "loss_pairs=\"stars_anchor\"",
-                 "shared_encoder=true", "ema_decay=0.9", "point_invariants=true", f"out_dir=\"{tmp / 'ablation'}\""])
+                 "shared_encoder=true", "ema_decay=0.9", "point_invariants=true", 'drop_inputs=["stars.age"]',
+                 f"out_dir=\"{tmp / 'ablation'}\""])
 ab = json.loads((tmp / "ablation" / "history.json").read_text())
 assert set(ab["pair_loss"][0]) == {"stars-dm", "stars-gas", "stars-hi"}, "the anchor trains only the stars pairs"
 assert "r1/dm->gas" in ab["val"][-1] and len(ab["val"]) == 2, "validation keeps every direction"
@@ -313,28 +542,75 @@ px_model.load_state_dict(load_checkpoint(tmp / "pnx" / "best.pt")["model_state_d
 assert type(px_model.encoders["gas"]).__name__ == "PointNeXtEncoder" and len(px_model.encoders["gas"].stages) == 4
 for bad in (['encoder="pointnet3"'], ['sa_sampling="random"'], ['encoder="pointnet2"', "sa_centres=[16,32]"],
             ['encoder="pointnet2"', "sa_neighbours=[8]"], ['encoder="pointnext"', "nx_blocks=[1,1]"],
-            ['encoder="pointnext"', "nx_centres=[8,16,4,2]"], ['encoder="pointnext"', "nx_expansion=0"]):
+            ['encoder="pointnext"', "nx_centres=[8,16,4,2]"], ['encoder="pointnext"', "nx_expansion=0"],
+            ['encoder="vn_pointnet"', "vn_widths=[8]"], ['encoder="vn_pointnet"', "vn_widths=[0,8,8,8]"],
+            ['encoder="vn_pointnet"', "principal_axes=true"], ['encoder="vn_pointnet"', "pointnet_checkpoint=true"]):
     try:
         train_clip.TrainConfig.from_file(None, bad)
         raise AssertionError(f"{bad} should be refused")
     except SystemExit:
         pass
+train_clip.main(["--set", *common, "epochs=1", "principal_axes=true", f"out_dir=\"{tmp / 'principal'}\""])
+pr = json.loads((tmp / "principal" / "history.json").read_text())
+assert len(pr["val"]) == 2 and all(np.isfinite(pr["train_loss"])), "a principal-axes run trains and validates"
+pr_dict = json.loads((tmp / "principal" / "config.json").read_text())
+pr_model = train_clip.build_model(train_clip.TrainConfig(**pr_dict))
+pr_model.load_state_dict(load_checkpoint(tmp / "principal" / "best.pt")["model_state_dict"])
+assert pr_dict["principal_axes"] is True and pr_model.principal_axes
+older = train_clip.TrainConfig(**{k: v for k, v in pr_dict.items() if k != "principal_axes"})
+assert older.principal_axes is False and not train_clip.build_model(older).principal_axes, "older runs: off"
+keep = train_clip.build_datasets
+train_clip.build_datasets = lambda cfg: (Synthetic(96, 1, True), Synthetic(40, 2, True))   # the same clouds each run
+train_clip.main(["--set", *common, "epochs=1", f"out_dir=\"{tmp / 'pn_plain'}\""])
+train_clip.main(["--set", *common, "epochs=1", "pointnet_checkpoint=true", f"out_dir=\"{tmp / 'pn_redo'}\""])
+train_clip.build_datasets = keep
+h_plain, h_redo = (json.loads((tmp / d / "history.json").read_text()) for d in ("pn_plain", "pn_redo"))
+assert h_plain["train_loss"] == h_redo["train_loss"], "pointnet_checkpoint: the same training losses"
+assert [v["r1/mean"] for v in h_plain["val"]] == [v["r1/mean"] for v in h_redo["val"]], "and the same val R@1"
+rd_dict = json.loads((tmp / "pn_redo" / "config.json").read_text())
+rd_model = train_clip.build_model(train_clip.TrainConfig(**rd_dict))
+rd_model.load_state_dict(load_checkpoint(tmp / "pn_redo" / "best.pt")["model_state_dict"])
+assert rd_dict["pointnet_checkpoint"] is True and all(e.checkpoint for e in rd_model.encoders.values())
+no_option = {k: v for k, v in rd_dict.items() if k != "pointnet_checkpoint"}
+assert not train_clip.TrainConfig(**no_option).pointnet_checkpoint, "configs written before the option: off"
+train_clip.main(["--set", *common, "epochs=1", 'encoder="vn_pointnet"', "vn_widths=[8,16]", "vn_scalar_widths=[16,32]",
+                 f"out_dir=\"{tmp / 'vn'}\""])
+vh = json.loads((tmp / "vn" / "history.json").read_text())
+assert len(vh["val"]) == 2 and all(np.isfinite(vh["train_loss"])), "a Vector Neurons run trains and validates"
+vn_model = train_clip.build_model(train_clip.TrainConfig(**json.loads((tmp / "vn" / "config.json").read_text())))
+vn_model.load_state_dict(load_checkpoint(tmp / "vn" / "best.pt")["model_state_dict"])
+assert type(vn_model.encoders["dm"]).__name__ == "VNPointNetEncoder" and len(vn_model.encoders["dm"].blocks) == 2
+assert train_clip.TrainConfig(**{k: v for k, v in pr_dict.items() if not k.startswith("vn_")}).vn_widths == \
+    [32, 64, 128, 256], "older configs get the default widths"
 ab_cfg = train_clip.TrainConfig(**json.loads((tmp / "ablation" / "config.json").read_text()))
 rebuilt = train_clip.build_model(ab_cfg)
 rebuilt.load_state_dict(load_checkpoint(tmp / "ablation" / "best.pt")["model_state_dict"])
 assert ab_cfg.point_invariants and rebuilt.encoders["dm"][0][0].in_features == 3 + 1, "DM: positions + distance"
+assert ab_cfg.drop_inputs == ["stars.age"] and rebuilt.encoders["stars"][0][0].in_features == 3 + 1 + 1, \
+    "stars: positions + metallicity (age hidden) + distance"
+assert train_clip.TrainConfig(**{k: v for k, v in json.loads((tmp / "ablation" / "config.json").read_text()).items()
+                                 if k != "drop_inputs"}).drop_inputs == [], "older configs hide nothing"
 for bad in ('inputs="no_positions"', 'loss_pairs="dm_anchor"', 'patch_centres="random"', "shared_encoder=true",
-            'dm_aperture="r200c"'):
+            'dm_aperture="r200c"', 'drop_inputs=["stars.x"]', 'drop_inputs=["stars.mass"]', 'drop_inputs=["age"]'):
     try:
         train_clip.TrainConfig.from_file(None, [bad])
         raise AssertionError(f"{bad} should be refused")
     except SystemExit:
         pass
+try:
+    train_clip.TrainConfig.from_file(None, ['modalities=["stars","dm"]', 'drop_inputs=["gas.sf"]'])
+    raise AssertionError("hiding a column of a modality that is not trained should be refused")
+except SystemExit:
+    pass
 print(f"PASS training run: loss {hist['train_loss'][0]:.2f} -> {hist['train_loss'][-1]:.2f}, val R@1 "
       f"{hist['val'][0]['r1/mean']:.0%} -> {hist['val'][-1]['r1/mean']:.0%} (chance {hist['val'][0]['chance/mean']:.0%})"
       "; resume continues the history; the shuffle control runs; a run without velocities, with a stars anchor, a "
-      "shared encoder, EMA and point invariants runs and its checkpoint reloads; PointNet++ and PointNeXt runs train "
-      "and their checkpoints reload; unknown option values and bad PointNet++ levels or PointNeXt stages are refused")
+      "shared encoder, EMA, point invariants and the stars' age hidden runs and its checkpoint reloads; PointNet++ "
+      "and PointNeXt runs train "
+      "and their checkpoints reload; a principal-axes run trains and reloads, and configs written before the option "
+      "leave it off; a run with pointnet_checkpoint gives the plain run's losses and R@1 and reloads; a Vector "
+      "Neurons run trains and reloads; unknown option values, bad PointNet++ levels, PointNeXt stages or Vector "
+      "Neurons widths, principal axes with Vector Neurons and pointnet_checkpoint without PointNet are refused")
 
 # ---------------------------------------------------------------- scoring finished runs, linear probes (Phase D)
 import h5py                                                                            # noqa: E402

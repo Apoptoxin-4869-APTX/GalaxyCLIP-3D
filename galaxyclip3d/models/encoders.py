@@ -1,10 +1,12 @@
 """Point-cloud encoders: a cloud of N points with F values each, (B, N, F), becomes one feature vector, (B, D).
 
-Both encoders ignore the order of the points, and use LayerNorm rather than BatchNorm: a masked modality arrives as an
+All encoders ignore the order of the points, and use LayerNorm rather than BatchNorm: a masked modality arrives as an
 all-zero cloud, which must not leak into statistics shared across the batch.
 
 - PointNetEncoder: the same small network on every point, then max and mean pooling (Qi et al. 2017). A fast
-  baseline that sees each point alone, so it cannot use local structure.
+  baseline that sees each point alone, so it cannot use local structure. `checkpoint` recomputes each layer in the
+  backward pass instead of storing its intermediate results: the same output and gradients in much less GPU memory
+  (Stage E at batch 256: 27.7 instead of 58.7 GiB), for a training step about a quarter longer.
 - PatchTransformerEncoder: the Point-MAE / Point-BERT design (Pang et al. 2022, Yu et al. 2022). Farthest-point
   sampling picks `patches` centres, each centre takes its `patch_size` nearest points, a small PointNet turns each
   patch (positions relative to its centre, plus the other values) into a token, a transformer mixes the tokens with
@@ -25,11 +27,42 @@ all-zero cloud, which must not leak into statistics shared across the batch.
   feature, LayerNorm after the max (masked clouds are all zeros), GELU; max and mean pooling into the same head as the
   other encoders. Defaults: PointNeXt-B's block pattern (1, 2, 1, 1), 4,096 points reduced to 1,024, 512, 256 and 128
   centres, widths capped at 256 so an encoder has about as many parameters as the PointNet and PointNet++.
+- VNPointNetEncoder: a PointNet built from Vector Neurons (Deng et al. 2021), exactly unchanged by any rotation or
+  mirroring of the cloud, with no frame to estimate. Each point's position and velocity enter as two 3D vectors
+  (`vectors=1` without velocities) and its other values, plus its distance, speed, radial and tangential velocity, as
+  scalars. Every layer (VNBlock) mixes the vector channels linearly with the same weights for x, y and z and no bias,
+  feeds their lengths to the scalar channels (as in GVP, Jing et al. 2021), applies the Vector Neurons LeakyReLU along
+  learned directions, divides a point's vectors by their root-mean-square length and scales each by a sigmoid of the
+  new scalars. `checkpoint` recomputes each layer in the backward pass instead of storing its intermediate results:
+  the many vector-sized intermediates otherwise take about three times the PointNet's memory. Pooling: each vector
+  channel's softmax-weighted mean over the points, the weights from the dot product with a learned direction (a soft
+  version of Vector Neurons' max pooling, whose hard pick gives the direction no gradient and jumps between points
+  that tie to within rounding), and its plain mean, read off as dot products with three vectors computed from them
+  (Vector Neurons' invariant layer) plus their lengths, and the scalars' max and mean, into the same head as the other
+  encoders. Only lengths and dot products of vectors are used, never a cross product, so mirror images give the same
+  output too. A vector channel holds three numbers per point, so the default widths are about a third of the
+  PointNet's.
 """
 from __future__ import annotations
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
+
+
+def invariant_features(cloud: torch.Tensor, velocities: bool = True) -> torch.Tensor:
+    """(..., N, 4) per-point numbers that stay the same when a cloud is rotated or mirrored, from its positions
+    (columns 0-2) and velocities (3-5): distance from the centre, speed, radial velocity and tangential speed.
+    (..., N, 1), the distance only, with velocities=False. All-zero (masked) clouds give zeros."""
+    pos = cloud[..., 0:3].float()
+    r = pos.norm(dim=-1, keepdim=True)
+    if not velocities:
+        return r
+    vel = cloud[..., 3:6].float()
+    rr = r.clamp_min(1e-6)
+    radial = (pos * vel).sum(-1, keepdim=True) / rr
+    tangential = torch.linalg.cross(pos, vel, dim=-1).norm(dim=-1, keepdim=True) / rr
+    return torch.cat([r, vel.norm(dim=-1, keepdim=True), radial, tangential], dim=-1)
 
 
 def mlp(dims: list[int], final_act: bool = True) -> nn.Sequential:
@@ -41,9 +74,27 @@ def mlp(dims: list[int], final_act: bool = True) -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
+def layer_groups(seq: nn.Sequential) -> list[list[nn.Module]]:
+    """The modules of an mlp() split before each Linear: one group per layer (Linear, LayerNorm, GELU)."""
+    groups: list[list[nn.Module]] = []
+    for module in seq:
+        if isinstance(module, nn.Linear) or not groups:
+            groups.append([])
+        groups[-1].append(module)
+    return groups
+
+
+def run_layers(modules: list[nn.Module], h: torch.Tensor) -> torch.Tensor:
+    for module in modules:
+        h = module(h)
+    return h
+
+
 class PointNetEncoder(nn.Module):
-    def __init__(self, in_dim: int, widths=(64, 128, 256, 512), out_dim: int = 512, dropout: float = 0.0):
+    def __init__(self, in_dim: int, widths=(64, 128, 256, 512), out_dim: int = 512, dropout: float = 0.0,
+                 checkpoint: bool = False):
         super().__init__()
+        self.checkpoint = checkpoint             # recompute each layer in the backward pass instead of storing it
         self.point_mlp = mlp([in_dim, *widths])
         last = widths[-1] if len(widths) else in_dim
         self.head = nn.Sequential(nn.Linear(2 * last, out_dim), nn.LayerNorm(out_dim), nn.GELU(),
@@ -51,7 +102,12 @@ class PointNetEncoder(nn.Module):
         self.out_dim = out_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.point_mlp(x)
+        if self.checkpoint and torch.is_grad_enabled():
+            h = x
+            for modules in layer_groups(self.point_mlp):
+                h = torch.utils.checkpoint.checkpoint(run_layers, modules, h, use_reentrant=False)
+        else:
+            h = self.point_mlp(x)
         return self.head(torch.cat([h.max(dim=1).values, h.mean(dim=1)], dim=-1))
 
 
@@ -271,9 +327,102 @@ class PointNeXtEncoder(nn.Module):
         return self.head(torch.cat([f.max(dim=1).values, f.mean(dim=1)], dim=-1))
 
 
+VN_EPS = 1e-6
+
+
+def vn_length(v: torch.Tensor) -> torch.Tensor:
+    """Lengths (..., C) of vector channels (..., 3, C), smooth at zero (masked clouds are all zeros)."""
+    return torch.sqrt((v * v).sum(dim=-2) + VN_EPS)
+
+
+def vn_leaky_relu(q: torch.Tensor, d: torch.Tensor, slope: float = 0.2) -> torch.Tensor:
+    """Vector Neurons' LeakyReLU on vector channels (..., 3, C): where a vector q points away from its learned
+    direction d, its part along d is removed except a fraction `slope`; elsewhere q is kept. Dot products only.
+    Directions much shorter than the point's typical one (below a tenth of its root-mean-square length) fade out
+    smoothly instead of acting with a direction made of rounding noise (Vector Neurons' fixed 1e-6 floor lets the
+    noise of near-zero directions, common when parallel vectors cancel in a mix, through almost 1,000 times)."""
+    dot = (q * d).sum(dim=-2, keepdim=True)
+    dd = (d * d).sum(dim=-2, keepdim=True)
+    return q - (1 - slope) * dot.clamp(max=0) / (dd + 1e-2 * dd.mean(dim=-1, keepdim=True) + VN_EPS) * d
+
+
+def vn_rms(v: torch.Tensor) -> torch.Tensor:
+    """(..., 1) the root-mean-square length of each point's vector channels (..., 3, C), smooth at zero."""
+    return torch.sqrt((v * v).sum(dim=-2).mean(dim=-1, keepdim=True) + VN_EPS)
+
+
+class VNBlock(nn.Module):
+    """One layer on every point of vector channels (..., 3, Cv) and scalar channels (..., Cs): the vectors are mixed
+    linearly (no bias, the same weights for x, y and z), their lengths join the scalars' input, and the mixed vectors
+    go through the Vector Neurons LeakyReLU along directions mixed from the input vectors, are divided by their
+    root-mean-square length (one factor per point, so short vectors stay short: dividing each channel by its own length
+    would blow up the rounding noise of near-zero vectors, common when parallel vectors cancel in a mix) and scaled by
+    a sigmoid gate from the new scalars. The LeakyReLU commutes with positive factors, so the division and the gate
+    are applied together after it, which saves one vector-sized tensor per layer."""
+
+    def __init__(self, vectors_in: int, scalars_in: int, vectors_out: int, scalars_out: int, slope: float = 0.2):
+        super().__init__()
+        self.mix = nn.Linear(vectors_in, vectors_out, bias=False)
+        self.direction = nn.Linear(vectors_in, vectors_out, bias=False)
+        self.scalar = nn.Sequential(nn.Linear(scalars_in + vectors_out, scalars_out), nn.LayerNorm(scalars_out),
+                                    nn.GELU())
+        self.gate = nn.Linear(scalars_out, vectors_out)
+        self.slope = slope
+
+    def forward(self, v: torch.Tensor, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.mix(v)
+        s = self.scalar(torch.cat([s, vn_length(h).to(s.dtype)], dim=-1))
+        scale = torch.sigmoid(self.gate(s)) / vn_rms(h)
+        return vn_leaky_relu(h, self.direction(v).to(h.dtype), self.slope) * scale.unsqueeze(-2).to(h.dtype), s
+
+
+class VNPointNetEncoder(nn.Module):
+    def __init__(self, in_dim: int, vectors: int = 2, widths=(32, 64, 128, 256), scalar_widths=(64, 128, 256, 512),
+                 out_dim: int = 512, dropout: float = 0.0, slope: float = 0.2, checkpoint: bool = False):
+        super().__init__()
+        self.checkpoint = checkpoint             # recompute each layer in the backward pass instead of storing it
+        if vectors not in (1, 2):
+            raise ValueError(f"vectors must be 1 (positions) or 2 (positions and velocities), got {vectors}")
+        if not widths or len(widths) != len(scalar_widths) or min(widths) < 1 or min(scalar_widths) < 1:
+            raise ValueError(f"widths and scalar_widths need the same number of positive entries, got "
+                             f"{list(widths)}, {list(scalar_widths)}")
+        if in_dim < 3 * vectors:
+            raise ValueError(f"{in_dim} input columns cannot hold {vectors} vector(s)")
+        self.vectors = vectors
+        cv, cs = vectors, in_dim - 3 * vectors + (4 if vectors == 2 else 1)    # + the points' invariant numbers
+        self.blocks = nn.ModuleList()
+        for wv, ws in zip(widths, scalar_widths):
+            self.blocks.append(VNBlock(cv, cs, wv, ws, slope))
+            cv, cs = wv, ws
+        self.pool_direction = nn.Linear(cv, cv, bias=False)
+        self.frame = nn.Linear(2 * cv, 3, bias=False)
+        self.head = nn.Sequential(nn.Linear(2 * cv * 3 + 2 * cv + 2 * cs, out_dim), nn.LayerNorm(out_dim), nn.GELU(),
+                                  nn.Dropout(dropout), nn.Linear(out_dim, out_dim))
+        self.out_dim = out_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, _ = x.shape
+        k = 3 * self.vectors
+        v = x[..., :k].reshape(b, n, self.vectors, 3).transpose(-1, -2)            # (B, N, 3, vectors)
+        s = torch.cat([x[..., k:], invariant_features(x, self.vectors == 2).to(x.dtype)], dim=-1)
+        for block in self.blocks:
+            if self.checkpoint and torch.is_grad_enabled():
+                v, s = torch.utils.checkpoint.checkpoint(block, v, s, use_reentrant=False)
+            else:
+                v, s = block(v, s)
+        weight = torch.softmax((v * self.pool_direction(v)).sum(dim=-2).float(), dim=1)      # (B, N, C)
+        soft_max = torch.einsum("bnc,bnic->bic", weight.to(v.dtype), v)                    # (B, 3, C)
+        z = torch.cat([soft_max, v.mean(dim=1)], dim=-1)                                   # (B, 3, 2C)
+        proj = torch.einsum("bic,bij->bcj", z, self.frame(z)).flatten(1)            # dot products with 3 vectors
+        g = torch.cat([proj, vn_length(z).to(proj.dtype), s.max(dim=1).values.to(proj.dtype),
+                       s.mean(dim=1).to(proj.dtype)], dim=-1)
+        return self.head(g)
+
+
 def make_encoder(kind: str, in_dim: int, out_dim: int, **kw) -> nn.Module:
     if kind == "pointnet":
-        return PointNetEncoder(in_dim, kw.get("pointnet_widths", (64, 128, 256, 512)), out_dim, kw.get("dropout", 0.0))
+        return PointNetEncoder(in_dim, kw.get("pointnet_widths", (64, 128, 256, 512)), out_dim, kw.get("dropout", 0.0),
+                               checkpoint=kw.get("pointnet_checkpoint", False))
     if kind == "patch":
         return PatchTransformerEncoder(in_dim, kw.get("width", 384), kw.get("depth", 6), kw.get("heads", 6),
                                        kw.get("patches", 128), kw.get("patch_size", 32), kw.get("dropout", 0.0),
@@ -288,4 +437,8 @@ def make_encoder(kind: str, in_dim: int, out_dim: int, **kw) -> nn.Module:
                                 kw.get("nx_neighbours", (32, 32, 32, 32)), kw.get("nx_widths", (64, 128, 256, 256)),
                                 kw.get("nx_blocks", (1, 2, 1, 1)), kw.get("nx_expansion", 4),
                                 kw.get("sa_sampling", "radial"), kw.get("dropout", 0.0))
-    raise ValueError(f"unknown encoder {kind!r} (pointnet, patch, pointnet2 or pointnext)")
+    if kind == "vn_pointnet":
+        return VNPointNetEncoder(in_dim, kw.get("vectors", 2), kw.get("vn_widths", (32, 64, 128, 256)),
+                                 kw.get("vn_scalar_widths", (64, 128, 256, 512)), out_dim, kw.get("dropout", 0.0),
+                                 checkpoint=kw.get("vn_checkpoint", False))
+    raise ValueError(f"unknown encoder {kind!r} (pointnet, patch, pointnet2, pointnext or vn_pointnet)")

@@ -1,0 +1,15 @@
+{
+  "run_name": "stage_e_vn",
+  "wandb": true,
+  "out_dir": "outputs/clip/stage_e/vn",
+  "encoder": "vn_pointnet",
+  "vn_widths": [32, 64, 128, 256],
+  "vn_scalar_widths": [64, 128, 256, 512],
+  "vn_checkpoint": true,
+  "learn_temperature": true,
+  "epochs": 600,
+  "lr": 0.001,
+  "points": 4096,
+  "min_particles": 8192,
+  "modalities": ["stars", "dm", "gas"]
+}
