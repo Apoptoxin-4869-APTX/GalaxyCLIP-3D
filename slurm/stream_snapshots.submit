@@ -1,0 +1,95 @@
+#!/bin/bash
+# Stream TNG50-1 snapshots into the point-cloud dataset `complete` with tools/stream_snapshot.py, one after another:
+# each snapshot's files pass through the job's local /scratch (only the fields the builder reads, about 1.1 TB per
+# snapshot), are turned into point clouds as they arrive and are deleted again; nothing of the raw snapshot is kept
+# except its group catalog and offsets (7.4 GB, in tng50-1.new).
+#
+#   env -u SLURM_JOB_ID sbatch slurm/stream_snapshots.submit                    # 99 (local copy), then 91 84 78 67 50
+#   SNAPS="84 78" env -u SLURM_JOB_ID sbatch --export=ALL slurm/stream_snapshots.submit
+#   python3 tools/stream_snapshot.py status --out /cluster/projects/ska/illustris/tng50-1.pointclouds/complete --snap 91
+#
+# Snapshot 99 is built from the full local copy and must equal v3 array by array (tools/compare_pointclouds.py)
+# before any download starts, so `complete` keeps v3's train/val/test split (Stage E's test set stays the test set).
+# Every snapshot also gets the extra frozen sets v3 has (spheres 3 and 7.5 R1/2; 1,024 and 4,096 points at 5 R1/2).
+# Resumable: a rerun (or the requeue after the time limit) continues where the last one stopped.
+# Download settings (files in parallel, waits between attempts, attempts per file) can be changed while the job runs,
+# without a restart, in ${OUT}/stream_overrides.json; they replace WORKERS and the defaults (DATASET.md).
+#
+# Cluster rules this keeps: --account=cai_ivs; submit with `env -u SLURM_JOB_ID sbatch`; no GPU (no enforce-binding);
+# /usr/bin/python3 with the repo's pylibs works on both cpu nodes; /scratch is private to the job.
+#SBATCH --job-name=pc-stream
+#SBATCH --partition=cpu
+#SBATCH --account=cai_ivs
+#SBATCH --time=13:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=24G
+#SBATCH --signal=B:SIGUSR1@300
+#SBATCH --requeue
+#SBATCH --open-mode=append
+#SBATCH --output=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/stream_%j.out
+#SBATCH --error=/cluster/home/magilolg/dev/GalaxyCLIP_3D/slurm/log/stream_%j.out
+
+set -uo pipefail
+PROJECT_DIR=/cluster/home/magilolg/dev/GalaxyCLIP_3D
+CONFIG="${CONFIG:-configs/pc_complete.json}"
+OUT="${OUT:-/cluster/projects/ska/illustris/tng50-1.pointclouds/complete}"
+V3=/cluster/projects/ska/illustris/tng50-1.pointclouds/v3
+LOCAL=/cluster/projects/ska/illustris/tng50-1.new
+SNAPS="${SNAPS:-99 91 84 78 67 50}"
+WORKERS="${WORKERS:-25}"
+RAW="/scratch/${USER}/tng-stream"
+export PYTHONPATH="${PROJECT_DIR}/pylibs"
+PY="/usr/bin/python3 -s -u"
+
+# Requeue: forward SIGUSR1 to python (it stops after the running extractions), then requeue this job
+sig_handler_USR1() {
+    echo "STOP SIGNAL DETECTED — $(date)"
+    if [[ -n "${PY_PID:-}" ]]; then
+        kill -USR1 "${PY_PID}" 2>/dev/null || true
+        for i in $(seq 1 240); do kill -0 "${PY_PID}" 2>/dev/null || break; sleep 1; done
+    fi
+    scontrol requeue "${SLURM_JOB_ID}"
+    exit 0
+}
+trap 'sig_handler_USR1' USR1
+
+cd "${PROJECT_DIR}"
+echo "[stream] $(date) on $(hostname), job ${SLURM_JOB_ID:-none}, snapshots ${SNAPS}, out ${OUT}, ${WORKERS} parallel files"
+
+extra_frozen() {
+    local s=$1
+    for spec in "--radius 3" "--radius 7.5" "--radius 5 --budget 1024" "--radius 5 --budget 4096"; do
+        ${PY} tools/finalize_pointclouds.py --out "${OUT}" --snap "${s}" ${spec} --frozen-only || return 1
+    done
+}
+
+rc=0
+for s in ${SNAPS}; do
+    if [[ "${s}" == "99" ]]; then SRC="--source local:${LOCAL} --lineage-from ${V3}"; else SRC="--source api"; fi
+    for pass in 1 2 3 4 5; do
+        ${PY} tools/stream_snapshot.py run --config "${CONFIG}" --out "${OUT}" --snap "${s}" ${SRC} --raw "${RAW}" \
+            --fetch-workers "${WORKERS}" --extract-workers 8 &
+        PY_PID=$!
+        wait ${PY_PID}
+        rc=$?
+        [[ ${rc} -eq 0 || ${rc} -eq 2 || ${rc} -eq 3 ]] && break
+        echo "[stream] snapshot ${s}: pass ${pass} of 5 ended with code ${rc} — $(date); next pass in 5 minutes"
+        sleep 300 &
+        wait $!
+    done
+    [[ ${rc} -eq 3 ]] && exit 3
+    if [[ ${rc} -ne 0 ]]; then echo "[stream] snapshot ${s} not finished (code ${rc}); stopping — $(date)"; exit ${rc}; fi
+    if [[ ! -e "${OUT}/snap_$(printf %03d "${s}")/frozen/val_r5_p4096.h5" ]]; then
+        extra_frozen "${s}" || { echo "[stream] extra frozen sets of snapshot ${s} failed"; exit 1; }
+    fi
+    if [[ "${s}" == "99" && ! -e "${OUT}/snap_099/identical_to_v3.txt" ]]; then
+        ${PY} tools/compare_pointclouds.py --a "${V3}" --b "${OUT}" --snap 99 --frozen-warn-only > "${OUT}/snap_099/compare_v3.log" 2>&1
+        cmp_rc=$?
+        cat "${OUT}/snap_099/compare_v3.log"
+        if [[ ${cmp_rc} -ne 0 ]]; then echo "[stream] snapshot 99 differs from v3: stopping before any download"; exit 1; fi
+        cp "${OUT}/snap_099/compare_v3.log" "${OUT}/snap_099/identical_to_v3.txt"
+    fi
+done
+echo "[stream] all snapshots done — $(date)"

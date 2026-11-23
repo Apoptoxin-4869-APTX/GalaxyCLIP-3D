@@ -7,8 +7,10 @@ snapshots), OUT/snap_NNN/config.json, OUT/snap_NNN/selection.h5 (one entry per g
 select.py) and OUT/snap_NNN/lineage.h5, and records new split units in OUT/splits.h5.
 
 Splits follow the galaxies through time (galaxyclip3d/pointclouds/lineage.py): each galaxy's SubLink main branch is
-fetched from the TNG API (key in ~/.tng_api_key; about 5,000 small requests, a few minutes) and the z = 0 halo it ends
-in decides its split, so a galaxy's versions at different snapshots always share one. The first time, snapshot 99's
+fetched from the TNG API (key in ~/.tng_api_key; about 5,000 small requests, a few minutes to 40 minutes) and the
+z = 0 halo it ends in decides its split, so a galaxy's versions at different snapshots always share one. Galaxies that
+lie on a branch cached for a later snapshot of the dataset, one that reaches z = 0, take that branch without a
+request, after 100 of them have been compared with the API (--no-branch-reuse fetches all). The first time, snapshot 99's
 SubhaloGrNr is copied into OUT/splits.h5, so later snapshots can be linked after snapshot 99's raw data is deleted.
 
 Only root, snap and chunk_rows may differ from the dataset's settings. Running it again for the same snapshot changes
@@ -27,7 +29,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from galaxyclip3d.pointclouds import lineage                                   # noqa: E402
 from galaxyclip3d.pointclouds.config import Config                             # noqa: E402
-from galaxyclip3d.pointclouds.layout import read_table, snapshot_dir, write_table  # noqa: E402
+from galaxyclip3d.pointclouds.layout import read_table, snapshot_dir, snapshots_in, write_table  # noqa: E402
 from galaxyclip3d.pointclouds.select import SPLITS, select, shard_plan         # noqa: E402
 from galaxyclip3d.pointclouds.snapshot import Snapshot, read_catalog           # noqa: E402
 
@@ -51,6 +53,10 @@ def main() -> None:
                                       "(default: --root)")
     ap.add_argument("--workers", type=int, default=8, help="parallel API requests")
     ap.add_argument("--branches", type=Path, help="JSON {subhalo: [[snap, subhalo], ...]} instead of the TNG API")
+    ap.add_argument("--no-branch-reuse", action="store_true",
+                    help="fetch every branch from the API, also for galaxies on branches cached for later snapshots")
+    ap.add_argument("--check-reused", type=int, default=100,
+                    help="reused branches compared with the API first; one difference and all come from the API")
     args = ap.parse_args()
     cfg = Config.load(args.config)
     cfg = dataclasses.replace(cfg, **{k: v for k, v in (("snap", args.snap), ("root", args.root), ("out", args.out))
@@ -77,8 +83,15 @@ def main() -> None:
         branches = load_branches_json(args.branches)
     else:
         from galaxyclip3d.pointclouds.tng_api import ApiError, Client
+        later = [] if args.no_branch_reuse else [s for s in snapshots_in(out, "lineage.h5") if s > cfg.snap]
+        if later:
+            print(f"branches cached for later snapshots: {', '.join(map(str, later))}", flush=True)
         try:
-            branches = lineage.fetch_branches(cfg.snap, table["subhalo"], sdir / "lineage.h5", Client(), args.workers)
+            branches = lineage.fetch_branches(
+                cfg.snap, table["subhalo"], sdir / "lineage.h5", Client(), args.workers,
+                log=lambda m: print(m, flush=True),
+                reuse=[lineage.read_branches(snapshot_dir(out, s) / "lineage.h5") for s in later],
+                verify=args.check_reused)
         except ApiError as e:
             sys.exit(str(e))
     desc, has_branch = lineage.z0_descendants(cfg.snap, table["subhalo"], branches)

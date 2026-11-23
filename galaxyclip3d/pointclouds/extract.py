@@ -91,61 +91,72 @@ def convert(name: str, d: dict, galaxy: dict, units: ph.Units, wcorr: np.ndarray
     return {k: v if k == "sf" else np.asarray(v, dtype=np.float32) for k, v in out.items()}
 
 
-def extract(snap: Snapshot, cfg: Config, galaxy: dict) -> dict:
-    """{'gas'|'dm'|'stars': {field: array}, 'counts': {column: value}} for one row of the selection table."""
+def extract_type(snap: Snapshot, cfg: Config, galaxy: dict, name: str) -> tuple[dict[str, np.ndarray], dict]:
+    """One particle type ('gas', 'dm' or 'stars') of one galaxy: ({field: array}, {count column: value}).
+
+    Reads only the snapshot files that hold this galaxy's block of that type, so a streaming build
+    (stream.py) can run it as soon as those files are on disk."""
     u = snap.units
+    t = TYPES[name]
     rh = float(galaxy["rhalf_star_kpc"])
     radii_kpc = np.asarray(cfg.radii) * rh
     r_ext = cfg.extract_radius * rh
-    out: dict = {"counts": {}}
-    for name, t in TYPES.items():
-        start, n = int(galaxy["offsets"][t]), int(galaxy[f"n_{name}_bound"])
-        two_pass = n > cfg.cap                      # the sphere may still need capping: decide after a light pass
-        fields = FIRST_PASS[name] if two_pass else READ[name]
-        rows, radius, mass, hi = [], [], [], []
-        raw = {f: [] for f in fields}
-        for row0, ch in snap.blocks(t, start, n, fields, cfg.chunk_rows):
-            r = np.linalg.norm(u.kpc(ph.relative_positions(ch["Coordinates"], galaxy["centre"], u.box)), axis=1)
-            inside = r <= r_ext
-            if name == "stars":
-                inside &= ch["GFM_StellarFormationTime"] > 0        # wind cells are not stars
-            sel = np.flatnonzero(inside)
-            rows.append(row0 + sel)
-            radius.append(r[sel])
-            if name in ("gas", "stars"):
-                mass.append(np.asarray(ch["Masses"][sel], dtype=np.float64))
-            if name == "gas":
-                hi.append(mass[-1] * ch["NeutralHydrogenAbundance"][sel])
-            if not two_pass:
-                for f in fields:
-                    raw[f].append(ch[f][sel])
-        rows, radius = _cat(rows, np.int64), _cat(radius, np.float64)
-        for k, rk in zip(cfg.radii, radii_kpc):
-            out["counts"][f"n_{name}_r{k:g}"] = int((radius <= rk).sum())
+    counts: dict = {}
+    start, n = int(galaxy["offsets"][t]), int(galaxy[f"n_{name}_bound"])
+    two_pass = n > cfg.cap                      # the sphere may still need capping: decide after a light pass
+    fields = FIRST_PASS[name] if two_pass else READ[name]
+    rows, radius, mass, hi = [], [], [], []
+    raw = {f: [] for f in fields}
+    for row0, ch in snap.blocks(t, start, n, fields, cfg.chunk_rows):
+        r = np.linalg.norm(u.kpc(ph.relative_positions(ch["Coordinates"], galaxy["centre"], u.box)), axis=1)
+        inside = r <= r_ext
+        if name == "stars":
+            inside &= ch["GFM_StellarFormationTime"] > 0        # wind cells are not stars
+        sel = np.flatnonzero(inside)
+        rows.append(row0 + sel)
+        radius.append(r[sel])
+        if name in ("gas", "stars"):
+            mass.append(np.asarray(ch["Masses"][sel], dtype=np.float64))
         if name == "gas":
-            hi_all = _cat(hi, np.float64)
-            for k, rk in zip(cfg.radii, radii_kpc):
-                w = hi_all[radius <= rk]
-                out["counts"][f"hi_eff_r{k:g}"] = float(w.sum() ** 2 / (w ** 2).sum()) if w.sum() > 0 else 0.0
-        if len(rows) > cfg.cap:
-            if name == "dm":
-                q = np.ones(len(rows))
-            else:
-                m = _cat(mass, np.float64)
-                q = m / m.sum()
-                if name == "gas" and hi_all.sum() > 0:
-                    q = 0.5 * q + 0.5 * hi_all / hi_all.sum()
-            pi = inclusion_probabilities(q, cfg.cap)
-            rng = np.random.default_rng([cfg.seed, int(galaxy["subhalo"]), t])
-            take = rng.random(len(rows)) < pi
-            wcorr = 1.0 / pi[take]
+            hi.append(mass[-1] * ch["NeutralHydrogenAbundance"][sel])
+        if not two_pass:
+            for f in fields:
+                raw[f].append(ch[f][sel])
+    rows, radius = _cat(rows, np.int64), _cat(radius, np.float64)
+    for k, rk in zip(cfg.radii, radii_kpc):
+        counts[f"n_{name}_r{k:g}"] = int((radius <= rk).sum())
+    if name == "gas":
+        hi_all = _cat(hi, np.float64)
+        for k, rk in zip(cfg.radii, radii_kpc):
+            w = hi_all[radius <= rk]
+            counts[f"hi_eff_r{k:g}"] = float(w.sum() ** 2 / (w ** 2).sum()) if w.sum() > 0 else 0.0
+    if len(rows) > cfg.cap:
+        if name == "dm":
+            q = np.ones(len(rows))
         else:
-            take, wcorr = np.ones(len(rows), dtype=bool), np.ones(len(rows))
-        if two_pass:
-            raw = _gather(snap, t, start, n, READ[name], rows[take], cfg.chunk_rows)
-            data = {f: _cat(v, np.float64) for f, v in raw.items()}
-        else:
-            data = {f: _cat(v, np.float64)[take] for f, v in raw.items()}
-        out[name] = convert(name, data, galaxy, u, wcorr)
-        out["counts"][f"n_{name}_stored"] = int(take.sum())
+            m = _cat(mass, np.float64)
+            q = m / m.sum()
+            if name == "gas" and hi_all.sum() > 0:
+                q = 0.5 * q + 0.5 * hi_all / hi_all.sum()
+        pi = inclusion_probabilities(q, cfg.cap)
+        rng = np.random.default_rng([cfg.seed, int(galaxy["subhalo"]), t])
+        take = rng.random(len(rows)) < pi
+        wcorr = 1.0 / pi[take]
+    else:
+        take, wcorr = np.ones(len(rows), dtype=bool), np.ones(len(rows))
+    if two_pass:
+        raw = _gather(snap, t, start, n, READ[name], rows[take], cfg.chunk_rows)
+        data = {f: _cat(v, np.float64) for f, v in raw.items()}
+    else:
+        data = {f: _cat(v, np.float64)[take] for f, v in raw.items()}
+    counts[f"n_{name}_stored"] = int(take.sum())
+    return convert(name, data, galaxy, u, wcorr), counts
+
+
+def extract(snap: Snapshot, cfg: Config, galaxy: dict) -> dict:
+    """{'gas'|'dm'|'stars': {field: array}, 'counts': {column: value}} for one row of the selection table."""
+    out: dict = {"counts": {}}
+    for name in TYPES:
+        out[name], counts = extract_type(snap, cfg, galaxy, name)
+        out["counts"].update(counts)
     return out

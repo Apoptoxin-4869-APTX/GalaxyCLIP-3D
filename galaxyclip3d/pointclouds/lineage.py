@@ -8,7 +8,9 @@ the rule of the single-snapshot builds. A galaxy whose branch does not reach sna
 its own snapshot (unit (snap, group)).
 
 Branches come from the TNG API (sublink/simple.json, the main branch: descendants and progenitors as (snapshot,
-subhalo) pairs), so linking needs no raw data of other snapshots. OUT/splits.h5 keeps every unit's split and snapshot
+subhalo) pairs), so linking needs no raw data of other snapshots. A galaxy that lies on a branch already cached for a
+later snapshot, one that reaches z = 0, gets that branch without a request (reusable_branches; about 95% of the
+galaxies of snapshots 91 and 84, every one identical to its API branch). OUT/splits.h5 keeps every unit's split and snapshot
 99's SubhaloGrNr, which turns a descendant into its halo after snapshot 99's raw data is gone. Units seen before keep
 their split; new units are dealt like the first snapshot's halos (select.assign_splits): with the dataset seed for the
 first snapshot of a dataset, with (seed, snapshot) for every later one.
@@ -63,19 +65,46 @@ def parse_simple(doc: dict) -> np.ndarray:
     return main[np.argsort(main[:, 0], kind="stable")]
 
 
-def fetch_branches(snap: int, subhalos, cache: Path, client, workers: int = 8, log=print) -> dict[int, np.ndarray]:
+def reusable_branches(snap: int, subhalos, caches) -> dict[int, np.ndarray]:
+    """Branches for galaxies at `snap` taken from branches cached for later snapshots, with no API request: a galaxy
+    on a cached branch that reaches z = 0 gets that branch, which is the branch the API gives it (all 9,983 such
+    galaxies of snapshots 91 and 84 had identical API branches). Branches that end before z = 0 are not used (the
+    API's branches differed for those), nor branches that disagree for the same galaxy."""
+    want = {int(s) for s in subhalos}
+    found: dict[int, np.ndarray] = {}
+    clash: set[int] = set()
+    for cache in caches:
+        for b in cache.values():
+            if len(b) == 0 or not (b[:, 0] == Z0_SNAP).any():
+                continue
+            for w in b[b[:, 0] == snap, 1]:
+                w = int(w)
+                if w not in want or w in clash:
+                    continue
+                if w not in found:
+                    found[w] = b
+                elif not np.array_equal(found[w], b):
+                    clash.add(w)
+                    del found[w]
+    return found
+
+
+def fetch_branches(snap: int, subhalos, cache: Path, client, workers: int = 8, log=print, reuse=(),
+                   verify: int = 100) -> dict[int, np.ndarray]:
     """Main branches of the given subhalos at `snap`, from the cache or else the API; the cache is updated as results
     come in, so an interrupted run loses little. Subhalos whose requests all failed are missing from the result (and
-    asked again next time); a subhalo the API has no tree for (HTTP 404) gets an empty branch."""
+    asked again next time); a subhalo the API has no tree for (HTTP 404) gets an empty branch.
+
+    `reuse`: branch caches of later snapshots ({subhalo: branch} each, from read_branches). Galaxies lying on one of
+    their branches that reach z = 0 take that branch (reusable_branches) once `verify` of them, drawn at random, have
+    the same branch at the API; if any differs (or fewer than half can be checked), every branch comes from the API."""
     branches = read_branches(cache)
     todo = [int(s) for s in subhalos if int(s) not in branches]
     attrs = {"snapshot": int(snap), "source": f"{client.api_base}/snapshots/{snap}/subhalos/<id>/sublink/simple.json",
              "fields": "Main branch: (snapshot, subhalo), descendants and progenitors"}
     if not todo:
         return branches
-    log(f"fetching {len(todo):,} merger-tree branches from the TNG API with {workers} parallel requests "
-        f"({len(branches):,} cached)")
-    t0, done, failed = time.time(), 0, []
+    failed: list[str] = []
 
     def one(s: int):
         try:
@@ -85,22 +114,53 @@ def fetch_branches(snap: int, subhalos, cache: Path, client, workers: int = 8, l
                 return s, np.empty((0, 2), dtype=np.int64)
             raise
 
-    with ThreadPoolExecutor(workers) as pool:
-        futures = [pool.submit(one, s) for s in todo]
-        for fut in as_completed(futures):
-            try:
-                s, b = fut.result()
-                branches[s] = b
-            except Exception as e:                      # noqa: BLE001  (reported, retried on the next run)
-                if getattr(e, "fatal", False):
-                    for f in futures:
-                        f.cancel()
-                    raise
-                failed.append(str(e))
-            done += 1
-            if done % 500 == 0 or done == len(todo):
-                write_branches(cache, branches, {**attrs, "updated": time.strftime("%Y-%m-%d %H:%M:%S")})
-                log(f"  {done:,}/{len(todo):,} in {time.time() - t0:.0f} s, {len(failed)} failed")
+    def fetch(subs: list[int]) -> dict[int, np.ndarray]:
+        """API branches of `subs` (failures counted in `failed`), saved into `branches` and the cache as they come."""
+        got: dict[int, np.ndarray] = {}
+        t0, done = time.time(), 0
+        with ThreadPoolExecutor(workers) as pool:
+            futures = [pool.submit(one, s) for s in subs]
+            for fut in as_completed(futures):
+                try:
+                    s, b = fut.result()
+                    got[s] = branches[s] = b
+                except Exception as e:                  # noqa: BLE001  (reported, retried on the next run)
+                    if getattr(e, "fatal", False):
+                        for f in futures:
+                            f.cancel()
+                        raise
+                    failed.append(str(e))
+                done += 1
+                if done % 500 == 0 or done == len(subs):
+                    write_branches(cache, branches, {**attrs, "updated": time.strftime("%Y-%m-%d %H:%M:%S")})
+                    log(f"  {done:,}/{len(subs):,} in {time.time() - t0:.0f} s, {len(failed)} failed")
+        return got
+
+    if reuse:
+        found = reusable_branches(snap, todo, reuse)
+        if found and verify > 0:
+            pick = np.random.default_rng(snap).choice(sorted(found), size=min(verify, len(found)), replace=False)
+            sample = sorted(int(s) for s in pick)
+            log(f"{len(found):,} of {len(todo):,} galaxies lie on branches cached for later snapshots that reach "
+                f"z = 0; comparing {len(sample)} of them with the TNG API first")
+            api = fetch(sample)
+            differ = [s for s in sample if s in api and not np.array_equal(api[s], found[s])]
+            if differ or 2 * len(api) < len(sample):
+                log(f"  {len(differ)} differ, {len(sample) - len(api)} could not be checked: every branch comes "
+                    f"from the API")
+                found = {}
+            else:
+                log(f"  all {len(api)} checked are identical: the other {len(found) - len(api):,} need no request")
+        branches.update(found)
+        if found:
+            attrs["reused"] = (f"{len(found):,} branches taken from branches cached for later snapshots that reach "
+                               f"z = 0 ({min(verify, len(found))} compared with the API first, all identical)")
+            write_branches(cache, branches, {**attrs, "updated": time.strftime("%Y-%m-%d %H:%M:%S")})
+        todo = [s for s in todo if s not in branches]
+    if todo:
+        log(f"fetching {len(todo):,} merger-tree branches from the TNG API with {workers} parallel requests "
+            f"({len(branches):,} cached or reused)")
+        fetch(todo)
     if failed:
         log(f"{len(failed)} requests failed, e.g. {failed[0]}")
     return branches

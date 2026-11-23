@@ -242,8 +242,50 @@ try:
     raise AssertionError("a rejected key must stop the fetching")
 except ApiError:
     pass
+
+# branches cached for later snapshots: used only if they reach z = 0 and agree, and only after a check with the API
+P = lineage.parse_simple
+LATER = [{10: P({"Main": [[90, 20], [91, 21], [99, 10]]}),
+          11: P({"Main": [[91, 22], [95, 23], [99, 11]]})},
+         {30: P({"Main": [[91, 26], [93, 30]]}),                       # ends before z = 0: not used for 26
+          31: P({"Main": [[90, 24], [91, 25], [99, 12]]}),
+          32: P({"Main": [[89, 40], [91, 25], [99, 13]]})}]            # disagrees with 31 about 25: not used
+TRUTH = {21: LATER[0][10], 22: LATER[0][11], 25: LATER[1][31], 26: P({"Main": [[90, 50], [91, 26], [96, 51]]}),
+         27: P({"Main": [[91, 27], [99, 14]]})}
+assert sorted(lineage.reusable_branches(91, [21, 22, 25, 26, 27], LATER)) == [21, 22]
+
+
+class TruthClient(FakeClient):
+    def __init__(self, truth):
+        super().__init__()
+        self.truth, self.asked = truth, []
+
+    def get_json(self, path):
+        self.calls += 1
+        s = int(path.split("/")[3])
+        self.asked.append(s)
+        return {"Main": self.truth[s].tolist(), "Mergers": []}
+
+
+subs = [21, 22, 25, 26, 27]
+tc = TruthClient(TRUTH)                                  # check 1 of the 2 reusable: identical, so 1 request saved
+got = lineage.fetch_branches(91, subs, TMP / "reuse1.h5", tc, workers=2, log=lambda *a: None, reuse=LATER, verify=1)
+assert tc.calls == 4 and {25, 26, 27} <= set(tc.asked), tc.asked
+assert all(np.array_equal(got[s], TRUTH[s]) for s in subs)
+assert all(np.array_equal(lineage.read_branches(TMP / "reuse1.h5")[s], TRUTH[s]) for s in subs), "reused ones cached"
+tc0 = TruthClient(TRUTH)                                 # no check: no request for 21 and 22
+got = lineage.fetch_branches(91, subs, TMP / "reuse0.h5", tc0, workers=2, log=lambda *a: None, reuse=LATER, verify=0)
+assert sorted(tc0.asked) == [25, 26, 27] and all(np.array_equal(got[s], TRUTH[s]) for s in subs)
+other = {**TRUTH, 22: P({"Main": [[91, 22], [99, 11]]})}         # the API says otherwise for 22
+msgs = []
+tcx = TruthClient(other)
+got = lineage.fetch_branches(91, subs, TMP / "reuse_x.h5", tcx, workers=2, log=msgs.append, reuse=LATER, verify=2)
+assert sorted(tcx.asked) == subs, "one difference in the check: every branch from the API (the checked ones once)"
+assert all(np.array_equal(got[s], other[s]) for s in subs) and any("every branch comes from the API" in m for m in msgs)
 print("PASS lineage: the first snapshot's split equals the old halo split, rerunning changes nothing, branches parsed "
-      "and cached (failed requests retried on the next run), descendants turned into z = 0 halos, own halo without one")
+      "and cached (failed requests retried on the next run), descendants turned into z = 0 halos, own halo without one; "
+      "branches of later snapshots reused only if they reach z = 0 and agree, after a check with the API (one "
+      "difference and all come from the API)")
 
 # ---------------------------------------------------------------- extraction
 rows = {s: {k: v[i] for k, v in table.items()} for i, s in enumerate(table["subhalo"])}
@@ -581,6 +623,152 @@ else:
           "threshold keeps the galaxies above it (the gas modality too) with their frozen clouds, a lower one is "
           "refused; fewer modalities return only those, with the frozen clouds, rotations and seeded draws they "
           "have with all four")
+
+# ---------------------------------------------------------------- streaming build (tools/stream_snapshot.py)
+def h5_arrays(path):
+    out_ = {}
+    with h5py.File(path, "r") as f:
+        f.visititems(lambda k, v: out_.__setitem__(k, v[()]) if isinstance(v, h5py.Dataset) else None)
+    return out_
+
+
+out_s, raw_s = TMP / "out_stream", TMP / "raw_stream"
+out_s.mkdir()
+lineage.save_splits(out_s, PRESET, None, ("train", "val", "test"))       # the same preset units as `out`
+src_files = sorted((TMP / "snap" / "snapshots").rglob("*.hdf5"))
+for sn, br in ((99, "branches_99.json"), (91, "branches_91.json")):
+    if sn == 91:            # settings file, read at the start: valid values replace the command line's, others not
+        (out_s / "stream_overrides.json").write_text(json.dumps({"fetch_workers": 3, "max_backoff": 60,
+                                                                 "retries": 0, "colour": "red"}))
+    log = run(REPO / "tools" / "stream_snapshot.py", "run", "--config", cfg_path, "--out", out_s, "--snap", sn,
+              "--source", f"local:{TMP / 'snap'}", "--raw", raw_s, "--branches", TMP / br, "--fetch-workers", 2,
+              "--extract-workers", 2, "--min-free-gb", 0)
+    assert f"=== snapshot {sn} finished" in log, log[-3000:]
+    if sn == 91:
+        assert "fetch_workers 2 -> 3" in log and "max_backoff 900 -> 60" in log, log[-3000:]
+        assert "retries = 0 ignored" in log and "unknown setting 'colour' ignored" in log, log[-3000:]
+        (out_s / "stream_overrides.json").unlink()
+    for name in ("selection.h5",):
+        a, b = h5_arrays(snapshot_dir(out, sn) / name), h5_arrays(snapshot_dir(out_s, sn) / name)
+        assert a.keys() == b.keys() and all(np.array_equal(a[k], b[k]) for k in a), (sn, name)
+    shards = sorted((snapshot_dir(out, sn) / "shards").glob("shard_*.h5"))
+    assert shards and len(shards) == len(list((snapshot_dir(out_s, sn) / "shards").glob("shard_*.h5")))
+    for sp in shards:
+        a, b = h5_arrays(sp), h5_arrays(snapshot_dir(out_s, sn) / "shards" / sp.name)
+        assert a.keys() == b.keys(), (sn, sp.name, set(a) ^ set(b))
+        for k in a:
+            assert np.array_equal(a[k], b[k]), (sn, sp.name, k)
+    assert not (snapshot_dir(out_s, sn) / "staging").exists() and not (raw_s / "snapshots" / f"{sn:03d}").exists()
+    assert (snapshot_dir(out_s, sn) / "index.h5").exists()
+assert all(p_.exists() and not p_.is_symlink() for p_ in src_files), "local mode must never delete source files"
+a, b = h5_arrays(out / "splits.h5"), h5_arrays(out_s / "splits.h5")
+assert a.keys() == b.keys() and all(np.array_equal(a[k], b[k]) for k in a)
+assert "already finished" in run(REPO / "tools" / "stream_snapshot.py", "run", "--config", cfg_path, "--out", out_s,
+                                 "--snap", 99, "--source", f"local:{TMP / 'snap'}", "--raw", raw_s, "--min-free-gb", 0)
+print("PASS streaming (local source): snapshots 99 and 91 built block by block give the same selection, shards and "
+      "splits as the classic build; staging and raw files removed, source files untouched; a finished snapshot "
+      "is skipped; a settings file replaces the command line's download settings at the start")
+
+# ---------------------------------------------------------------- download settings changed while a job runs
+import argparse                                   # noqa: E402
+sys.path.insert(0, str(REPO / "tools"))
+import stream_snapshot                            # noqa: E402
+
+ov_path = TMP / "overrides.json"
+ns = argparse.Namespace(fetch_workers=25, max_backoff=900.0, retries=20, timeout=600.0)
+ov = stream_snapshot.Overrides(ov_path, ns)
+
+
+def write_ov(text, stamp=[0]):                    # a distinct mtime each time, whatever the filesystem's resolution
+    ov_path.write_text(text)
+    stamp[0] += 1
+    os.utime(ov_path, ns=(stamp[0] * 10**9, stamp[0] * 10**9))
+
+
+assert ov.tune() == 25 and vars(ns) == dict(fetch_workers=25, max_backoff=900.0, retries=20, timeout=600.0)
+write_ov('{"fetch_workers": 50, "max_backoff": 120, "retries": 90}')
+assert ov.tune() == 50 and (ns.max_backoff, ns.retries, ns.timeout) == (120.0, 90, 600.0)
+assert isinstance(ns.max_backoff, float) and isinstance(ns.retries, int)
+write_ov('{"fetch_workers": 50, "max_backoff": 1')                 # half written: everything stays as it was
+assert ov.tune() == 50 and (ns.max_backoff, ns.retries) == (120.0, 90)
+write_ov('{"fetch_workers": 12, "timeout": 5, "retries": 2.5}')    # settings left out: the command line's again
+assert ov.tune() == 12 and (ns.max_backoff, ns.retries, ns.timeout) == (900.0, 20, 600.0)
+ov_path.unlink()
+assert ov.tune() == 25 and vars(ns) == dict(fetch_workers=25, max_backoff=900.0, retries=20, timeout=600.0)
+
+# the streamer follows tune() while it runs: snapshot 99 again with 80 pretend files of 0.2 s each, one file at a
+# time, then 4, then 2; the shards must still equal the classic build's
+DRIVER = '''
+import dataclasses, json, sys, threading, time
+from pathlib import Path
+REPO = Path(sys.argv[1])
+sys.path[:0] = [str(REPO), str(REPO / "tools")]
+import h5py
+import numpy as np
+from galaxyclip3d.pointclouds.stream import Streamer, assemble
+from build_pointclouds import load_snapshot_build
+
+
+def main():
+    src, out_d, root = Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
+    cfg, table = load_snapshot_build(src, 99, str(root))
+    cfg = dataclasses.replace(cfg, out=str(out_d))
+    with h5py.File(root / "snapshots" / "099" / "snap_099.0.hdf5", "r") as f:
+        totals = [int(t) for t in f["Header"].attrs["NumPart_Total"]]
+    n_files = 80                                   # each particle type spread evenly over 80 pretend files
+    fo = np.stack([np.arange(n_files, dtype=np.int64) * t // n_files for t in totals], axis=1)
+    lock = threading.Lock()
+    st = {"active": 0, "done": 0, "target": 1, "changed": {}}
+    starts = []
+
+    def fetch(j):                                  # the real files are there all along; a fetch only takes time
+        with lock:
+            st["active"] += 1
+            starts.append((time.time(), st["active"]))
+        time.sleep(0.2)
+        with lock:
+            st["active"] -= 1
+            st["done"] += 1
+        return True
+
+    def tune():
+        n = len(streamer.need)
+        want = 1 if st["done"] < n // 6 else 4 if st["done"] < n // 2 else 2
+        if want != st["target"]:
+            st["changed"].setdefault(str(want), time.time())
+            st["target"] = want
+        return want
+
+    streamer = Streamer(cfg, table, fo, fetch, lambda j: None, lambda j: 0.0, 1.0, 1e12, 1, 2, threading.Event(),
+                        print, None, tune=tune, poll_s=0.05)
+    ok = streamer.run()
+    shards = assemble(cfg, table, {"built_by": "resize test"}, print)
+    print("RESULT " + json.dumps({"ok": ok, "need": len(streamer.need), "starts": starts, "changed": st["changed"],
+                                   "shards": shards}))
+
+
+if __name__ == "__main__":
+    main()
+'''
+(TMP / "resize_driver.py").write_text(DRIVER)
+out_d = TMP / "out_resize"
+txt = run(TMP / "resize_driver.py", REPO, out_s, out_d, TMP / "snap")
+res = json.loads(txt.split("RESULT ", 1)[1])
+starts, ch = res["starts"], res["changed"]
+assert res["ok"] and res["shards"] and res["need"] >= 24, txt[-3000:]
+assert "parallel files 1 -> 4" in txt and "parallel files 4 -> 2" in txt, txt[-3000:]
+assert all(a == 1 for t, a in starts if t < ch["4"]), "one file at a time before the change"
+assert max(a for _, a in starts) <= 4, "never more than the largest number asked for"
+assert max(a for t, a in starts if ch["4"] <= t < ch["2"]) >= 3, "more threads start when the number goes up"
+late = [a for t, a in starts if t > ch["2"] + 1.0]
+assert late and max(late) <= 2, ("threads above a lower number stop after their current file", late)
+for sp in sorted((snapshot_dir(out, 99) / "shards").glob("shard_*.h5")):
+    a, b = h5_arrays(sp), h5_arrays(snapshot_dir(out_d, 99) / "shards" / sp.name)
+    assert a.keys() == b.keys() and all(np.array_equal(a[k], b[k]) for k in a), sp.name
+print(f"PASS download settings while running: the settings file is validated (bad values ignored, a half-written "
+      f"file changes nothing, a removed setting falls back to the command line); the streamer follows tune() "
+      f"({res['need']} pretend files: 1, then up to {max(a for _, a in starts)}, then at most {max(late)} at a time) "
+      f"and still builds the classic shards")
 
 if os.environ.get("KEEP_TMP"):                    # KEEP_TMP=1 keeps the synthetic data and datasets to look at
     print("kept", TMP)

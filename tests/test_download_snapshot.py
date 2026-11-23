@@ -288,6 +288,18 @@ print("PASS --with-catalogs: group catalog (checked against its own list) and of
       "as the existing copy, and the checksum lists are copied along")
 
 reset()
+dest = TMP / "catalogs_only"
+Fake.faults = {101: ["504"]}
+run("get", dest, "--catalogs-only", check=0)
+for i in range(N_CATALOG):
+    assert (dest / "groupcats" / "099" / f"fof_subhalo_tab_099.{i}.hdf5").read_bytes() == CONTENT[100 + i]
+assert (dest / "offsets" / "offsets_099.hdf5").read_bytes() == CONTENT[200]
+assert not (dest / "snapshots").exists(), "catalogs-only must not touch the snapshot folder"
+st = run("status", dest, check=0).stdout
+assert f"{N_CATALOG + 1} of {N_CATALOG + 1} finished" in st, st
+print("PASS --catalogs-only: only the group catalog and offsets are fetched, nothing in snapshots/")
+
+reset()
 multi = TMP / "multi"
 nowhere = TMP / "nowhere" / "snapshots" / "099" / "checksums.txt"          # no local list: fetched from the API
 n_all = N_FILES + N_CATALOG + 1

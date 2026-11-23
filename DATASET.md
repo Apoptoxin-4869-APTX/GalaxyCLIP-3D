@@ -72,6 +72,15 @@ halo, gets that halo's split.
 - For another snapshot, `tools/build_selection.py` fetches each galaxy's main branch from the TNG API
   (`sublink/simple.json`, about 0.8 kB each; 5,254 branches took 7.6 minutes with 8 parallel requests and none failed)
   and looks up the halo of its snapshot-99 descendant in `splits.h5`, so the raw data of snapshot 99 is not needed.
+  The API's speed varies a lot: on 2026-11-19 the same requests took 37 minutes for snapshot 84 and later 30–90 s
+  each.
+- **Reused branches.** A galaxy that lies on a branch already cached for a *later* snapshot gets that branch without a
+  request, if the branch reaches snapshot 99 and every such cached branch agrees. Every galaxy on one chain of main
+  progenitors and descendants has the same main branch at the API, so the result is the same: all 9,983 galaxies this
+  covers at snapshots 91 (from 99's branches) and 84 (from 99's and 91's) had identical API branches, about 95% of
+  each snapshot. Branches that end before z = 0 are not reused, because there the API's branches differed (3 of 3).
+  Before reusing, `build_selection.py` compares 100 of them, drawn at random, with the API; if one differs, every
+  branch comes from the API. `--no-branch-reuse` turns this off.
 - Units already in `splits.h5` keep their split. New ones, z = 0 halos without a selected galaxy so far, are dealt
   like the first snapshot's halos, with seed (4869, snapshot), and recorded.
 - A galaxy whose branch does not reach snapshot 99 uses its own halo at its own snapshot as unit.
@@ -187,6 +196,49 @@ python tools/check_pointclouds.py --out /cluster/projects/ska/illustris/tng50-1.
   (`.splits.lock`).
 - **API.** The key must be in `~/.tng_api_key` (mode 600). Failed requests are retried; branches already fetched are
   cached in `snap_NNN/lineage.h5`, so rerunning after an API outage fetches only the rest.
+
+## Adding a snapshot by streaming (no raw snapshot stored)
+
+`tools/stream_snapshot.py` does all the steps above for a snapshot without ever storing it. The dataset
+`/cluster/projects/ska/illustris/tng50-1.pointclouds/complete` (settings `configs/pc_complete.json`, the same as v3)
+is built this way.
+
+```bash
+env -u SLURM_JOB_ID sbatch slurm/stream_snapshots.submit          # snapshot 99 from the local copy, then 91 84 78 67 50
+python3 tools/stream_snapshot.py status --out /cluster/projects/ska/illustris/tng50-1.pointclouds/complete --snap 91
+```
+
+- **How.** The builder reads each galaxy's bound particles, one contiguous block per particle type. TNG splits every
+  type over the 680 files on its own, so a galaxy's gas, dark matter and stars usually lie about 500 files apart
+  (snapshot 99), and 679 of the 680 files hold selected particles. The files therefore pass through the job's local
+  `/scratch` in order. Each (galaxy, type) block is extracted as soon as all its files are there and saved in
+  `snap_NNN/staging/`. Each file is deleted once every block that needs it is saved, which leaves at most a few dozen
+  files on disk (the largest block, subhalo 0's stars, spans 49). The shards are then written from the staged blocks
+  with the selection's shard plan, so they are the same as `build_pointclouds.py`'s.
+- **Only the needed fields.** The TNG API serves a snapshot file with chosen fields
+  (`files/snapshot-N.C.hdf5?gas=...&dm=...&stars=...`). The builder's 18 fields are 1.09 of the 2.92 TB (37%), about
+  1.6 GB per file. TNG has no checksums for these reduced files, so each file is checked instead: particle counts per
+  type against the offsets file, and every field present. `stream_snapshot.py probe` compares reduced files with a
+  full local copy; for snapshot 99 the arrays were identical.
+- **Kept:** the group catalog and offsets (`tng50-1.new/groupcats/NNN`, `offsets/`, 7.4 GB per snapshot), so a
+  selection can be redone later.
+- **Order.** Snapshot 99 goes first, so `splits.h5` is the same as v3's and Stage E's test galaxies stay test
+  galaxies. The submit script stops before any download unless `compare_pointclouds.py` finds snapshot 99 identical to
+  v3. Each snapshot also gets v3's extra frozen sets (spheres of 3 and 7.5 R1/2; 1,024 and 4,096 points at 5 R1/2).
+- **Restarting.** Staged blocks, shards and the selection live in the dataset folder, so a rerun (or the requeue after
+  the time limit) redoes only unfinished blocks and fetches again only the files they need.
+- **Speed.** The server builds each reduced file on request: about 40 s pass before the first byte, then a file comes
+  at about 12 MB/s. About 65% of attempts are refused (HTTP 403 after about 40 s, HTTP 504 after exactly 50 s) and
+  retried. Snapshot 91 with 25 files in parallel: 3.8 h of streaming, 1,092 GB at 79 MB/s, 1,237 refused attempts.
+  The server lets about 7 files download at once: 50 in parallel (snapshot 84, 30 min) gave the same 68–79 GB per
+  15 minutes with 87% of attempts refused, so 25 stays. Full files wait in the same queue (HTTP 403 after 35 s,
+  HTTP 504 after 50 s, first byte after 40 s, then 13–19 MB/s each), so they are no way around it.
+- **Changing download settings while a job runs.** `stream_overrides.json` in the dataset folder replaces the command
+  line's download settings, e.g. `{"fetch_workers": 50, "max_backoff": 120, "retries": 90}` (files in parallel; the
+  longest wait between attempts, in seconds; attempts per file; also `timeout`). It is read when a snapshot starts and
+  every 30 s while one streams, so a change takes effect within a minute: more threads start at once, and threads
+  above a lower number stop after their current file. A setting left out, or the file removed, means the command
+  line's value again. The log reports every change and ignores invalid values.
 
 ## Caveats
 

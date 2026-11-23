@@ -4,6 +4,7 @@
     python3 tools/download_snapshot.py get    --dest DEST --snap 91            # download; safe to restart any time
     python3 tools/download_snapshot.py status --dest DEST --snap 91 --watch 10 # progress, any node, no key needed
     python3 tools/download_snapshot.py verify --dest DEST --snap 91            # re-hash the finished files
+    python3 tools/download_snapshot.py get    --dest DEST --snap 91 --catalogs-only  # group catalog + offsets only
 (--snap defaults to 99.)
 
 A file gets its final name only after its size and sha256 have been checked. Until then it is
@@ -172,9 +173,11 @@ def build_items(args, meta: dict, opener, key: str) -> list[Item]:
                 sys.exit(f"{name} is not in the {kind} checksum list")
             items.append(Item(kind, name, f"{base}/files/{api_name}-{snap}.{i}.hdf5", str(subdir / name), digest))
 
-    sums = checksums_for(args, "snapshot", snap_dir, opener, key)
-    add_chunks("snapshot", "snapshot", "snap", snap_dir, sums, meta.get("num_files_snapshot"))
-    if args.with_catalogs:      # last: 681 small files, whose speed says nothing about the time left for the snapshot
+    if not getattr(args, "catalogs_only", False):
+        sums = checksums_for(args, "snapshot", snap_dir, opener, key)
+        add_chunks("snapshot", "snapshot", "snap", snap_dir, sums, meta.get("num_files_snapshot"))
+    if args.with_catalogs or getattr(args, "catalogs_only", False):
+        # last: 681 small files, whose speed says nothing about the time left for the snapshot
         sums = checksums_for(args, "groupcat", gc_dir, opener, key)
         add_chunks("groupcat", "groupcat", "fof_subhalo_tab", gc_dir, sums, meta.get("num_files_groupcat"))
         name = f"offsets_{snap:03d}.hdf5"
@@ -403,12 +406,17 @@ class Progress:
 
 # ---------------------------------------------------------------- download
 class Download:
-    def __init__(self, args, key: str, items: list[Item], progress: Progress):
+    """Workers that fetch Items with retries. `check(item, path)` (optional) inspects a finished file before it gets
+    its final name and raises Retry to have it fetched again; resume=False never continues a partial file (for files
+    the server generates on request, whose bytes may differ between requests)."""
+
+    def __init__(self, args, key: str, items: list[Item], progress: Progress, check=None, resume: bool = True):
         self.args, self.key, self.items, self.progress = args, key, items, progress
         self.opener = make_opener(args.api_base)
         self.todo: queue.Queue[Item] = queue.Queue()
         self.stop = threading.Event()
         self.fatal: str | None = None
+        self.check, self.resume = check, resume
 
     def hash_partial(self, item: Item, digest) -> None:
         """Hash what is already on disk: it may have been written by a job that was killed."""
@@ -431,9 +439,17 @@ class Download:
             if head != HDF5_SIGNATURE:
                 item.part.unlink()
                 raise Retry("not an HDF5 file; starting this file again")
+        if self.check is not None:
+            try:
+                self.check(item, item.part)
+            except Exception as e:
+                item.part.unlink(missing_ok=True)
+                raise Retry(f"failed the file check ({e}); starting this file again") from e
         os.replace(item.part, item.path)
 
     def fetch(self, item: Item) -> None:
+        if not self.resume:
+            item.part.unlink(missing_ok=True)
         offset = item.part.stat().st_size if item.part.exists() else 0
         known = self.progress.sizes.get(item.name)
         digest = hashlib.sha256()
@@ -488,47 +504,54 @@ class Download:
                 os.fsync(f.fileno())
         self.finalise(item, digest, total)
 
+    def get(self, item: Item) -> bool:
+        """Fetch one file, retrying temporary failures: True once it is finished and checked; False if it failed
+        for good (recorded in progress.failed), the download was stopped, or a fatal error stopped everything
+        (self.fatal)."""
+        self.progress.begin(item, "starting")
+        error = ""
+        for attempt in range(1, self.args.retries + 1):
+            try:
+                self.fetch(item)
+                a = self.progress.finish(item)
+                took = max(time.time() - a["t0"], 1e-6)
+                log(f"finished {item.name}  {human_bytes(a['done'])}  {human_bytes(a['got'] / took)}/s  "
+                    f"attempts {attempt}")
+                return True
+            except Stopped:
+                return False
+            except Fatal as e:
+                self.fatal = str(e)
+                self.stop.set()
+                return False
+            except Permanent as e:
+                self.progress.fail(item, str(e))
+                log(f"FAILED {item.name}: {e}")
+                return False
+            except (Retry, OSError, http.client.HTTPException, ValueError) as e:
+                if isinstance(e, OSError) and e.errno in FATAL_DISK:
+                    self.fatal = f"cannot write {item.part}: {e}"
+                    self.stop.set()
+                    return False
+                delay = getattr(e, "delay", None)
+                if delay is None:
+                    delay = min(self.args.max_backoff, 15 * 2 ** (attempt - 1)) * random.uniform(0.7, 1.3)
+                error = str(e) or type(e).__name__
+                self.progress.retry(item, attempt, error, delay)
+                log(f"{item.name}: attempt {attempt} failed ({error}); retrying in {delay:.0f} s")
+                if self.stop.wait(delay):
+                    return False
+        self.progress.fail(item, f"gave up after {self.args.retries} attempts: {error}")
+        log(f"FAILED {item.name}: gave up after {self.args.retries} attempts")
+        return False
+
     def work(self) -> None:
         while not self.stop.is_set():
             try:
                 item = self.todo.get_nowait()
             except queue.Empty:
                 return
-            self.progress.begin(item, "starting")
-            for attempt in range(1, self.args.retries + 1):
-                try:
-                    self.fetch(item)
-                    a = self.progress.finish(item)
-                    took = max(time.time() - a["t0"], 1e-6)
-                    log(f"finished {item.name}  {human_bytes(a['done'])}  {human_bytes(a['got'] / took)}/s  "
-                        f"attempts {attempt}")
-                    break
-                except Stopped:
-                    return
-                except Fatal as e:
-                    self.fatal = str(e)
-                    self.stop.set()
-                    return
-                except Permanent as e:
-                    self.progress.fail(item, str(e))
-                    log(f"FAILED {item.name}: {e}")
-                    break
-                except (Retry, OSError, http.client.HTTPException, ValueError) as e:
-                    if isinstance(e, OSError) and e.errno in FATAL_DISK:
-                        self.fatal = f"cannot write {item.part}: {e}"
-                        self.stop.set()
-                        return
-                    delay = getattr(e, "delay", None)
-                    if delay is None:
-                        delay = min(self.args.max_backoff, 15 * 2 ** (attempt - 1)) * random.uniform(0.7, 1.3)
-                    error = str(e) or type(e).__name__
-                    self.progress.retry(item, attempt, error, delay)
-                    log(f"{item.name}: attempt {attempt} failed ({error}); retrying in {delay:.0f} s")
-                    if self.stop.wait(delay):
-                        return
-            else:
-                self.progress.fail(item, f"gave up after {self.args.retries} attempts: {error}")
-                log(f"FAILED {item.name}: gave up after {self.args.retries} attempts")
+            self.get(item)
 
 
 def stamp() -> str:
@@ -802,6 +825,9 @@ def main() -> int:
     ap.add_argument("--snap", type=int, default=99)
     ap.add_argument("--workers", type=int, default=4, help="files downloaded in parallel")
     ap.add_argument("--with-catalogs", action="store_true", help="also fetch the group catalog and offsets (7.4 GB)")
+    ap.add_argument("--catalogs-only", action="store_true",
+                    help="fetch only the group catalog and offsets, no snapshot files (tools/stream_snapshot.py "
+                         "streams those)")
     ap.add_argument("--limit", type=int, help="fetch only this many files (for a test run)")
     ap.add_argument("--retries", type=int, default=20, help="attempts per file before giving up on it")
     ap.add_argument("--max-backoff", type=float, default=900, help="longest wait between attempts, seconds")
